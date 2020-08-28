@@ -1,0 +1,34 @@
+---
+deploy: true
+
+image:
+  repository: quay.io/redhat-gpe/replik8s
+  pullPolicy: IfNotPresent
+
+envVars: {}
+
+imagePullSecrets: []
+nameOverride: ""
+
+openshift:
+  build:
+    create: false
+    baseImage: quay.io/redhat-cop/python-kopf-s2i:latest
+    gitRepo: https://github.com/jkupferer/replik8s.git
+
+replicaCount: 1
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the name template
+  name:
+
+resources: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

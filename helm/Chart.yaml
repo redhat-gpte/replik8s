@@ -1,0 +1,7 @@
+---
+apiVersion: v2
+name: replik8s
+description: Kubernetes resource replication and backup
+type: application
+version: 0.0.1
+appVersion: 0.0.1

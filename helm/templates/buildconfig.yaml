@@ -1,0 +1,27 @@
+{{- if .Values.openshift.build.create -}}
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: {{ include "replik8s.name" . }}
+  labels:
+{{ include "replik8s.labels" . | nindent 4 }}
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: {{ include "replik8s.name" . }}:latest
+  postCommit: {}
+  resources: {}
+  runPolicy: Serial
+  source:
+    git:
+      uri: {{ .Values.openshift.build.gitRepo }}
+      ref: master
+  strategy:
+    sourceStrategy:
+      from:
+        kind: DockerImage
+        name: {{ .Values.openshift.build.baseImage }}
+      forcePull: true
+  triggers: []
+{{- end -}}
