@@ -6,6 +6,7 @@ import kubernetes
 import logging
 import os
 import re
+import time
 import yaml
 
 logging_format = '[%(asctime)s] [%(levelname)s] - %(message)s'
@@ -186,6 +187,61 @@ def restore_backup(backup_path, restore_status_on):
             or filename.endswith(".yml"):
                  restore_file(os.path.join(root, filename), restore_status_on)
 
+def stop_operators(operator_list):
+    # Check that all operator deployments exist
+    for operator in operator_list:
+        try:
+            deployment = custom_objects_api.get_namespaced_custom_object(
+                'apps', 'v1', operator['namespace'], 'deployments', operator['name']
+            )
+            operator['replicas'] = deployment['spec']['replicas']
+            operator['selector'] = deployment['spec']['selector']
+
+        except kubernetes.client.rest.ApiException as e:
+            if e.status == 404:
+                logger.error('Unable to find deployment %s in %s', operator['name'], operator['namespace'])
+                sys.exit(1)
+            else:
+                raise
+
+    for operator in operator_list:
+        logger.info('Scale deployment %s in %s to 0 replicas', operator['name'], operator['namespace'])
+        deployment = custom_objects_api.patch_namespaced_custom_object(
+            'apps', 'v1', operator['namespace'], 'deployments', operator['name'],
+            {"spec": {"replicas": 0}}
+        )
+
+    for operator in operator_list:
+        if 'matchLabels' not in operator['selector']:
+            logger.warning(
+                'Do not know how to find pods for %s in %s, no spec.selector.matchLabels',
+                operator['name'], operator['namespace']
+            )
+            continue
+
+        label_selector = ','.join(["{}={}".format(k, v) for k, v in operator['selector']['matchLabels'].items()])
+
+        attempt = 1
+        while True:
+            time.sleep(5)
+            pods = core_v1_api.list_namespaced_pod(
+                operator['namespace'], label_selector=label_selector
+            )
+            if 0 == len(pods.items):
+                break
+            attempt += 1
+            if attempt > 60:
+                raise Exception('Failed to scale down {} in {}'.format(operator['name'], operator['namespace']))
+            logger.info('Wait for deployment %s in %s to scale down', operator['name'], operator['namespace'])
+
+def restart_operators(operator_list):
+    for operator in operator_list:
+        logger.info('Scale deployment %s in %s to %d replicas', operator['name'], operator['namespace'], operator['replicas'])
+        deployment = custom_objects_api.patch_namespaced_custom_object(
+            'apps', 'v1', operator['namespace'], 'deployments', operator['name'],
+            {"spec": {"replicas": operator['replicas']}}
+        )
+
 def main():
     import argparse
     backup_path = os.environ.get('BACKUP_PATH', '')
@@ -199,6 +255,10 @@ def main():
         '--restore-status-on', metavar='PLURAL.APIGROUP', type=str, nargs='*', action='append',
         help='List of kinds of resources for which to restore status. Ex: widgets.example.com'
     )
+    parser.add_argument(
+        '--stop-operators', metavar='NAMESPACE/DEPLOYMENT', type=str, nargs='*', action='append',
+        help='List of operators to stop before restart and restart after completion.'
+    )
     args = parser.parse_args()
 
     if args.restore_status_on:
@@ -208,9 +268,28 @@ def main():
     else:
         restore_status_on = []
 
+    if args.stop_operators:
+        stop_operator_list = [item for sublist in args.stop_operators for item in sublist]
+    elif os.environ.get('STOP_OPERATORS'):
+        stop_operator_list = re.split(r'[ ,]+', os.environ['STOP_OPERATORS'])
+    else:
+        stop_operator_list = []
+
+    for operator_spec in stop_operator_list:
+        if not re.match(r'^[a-z0-9\-]+/[a-z0-9\-]+$', 'foo/bar'):
+            print("Invalid value for STOP_OPERATORS, must be in format NAMESPACE/NAME")
+            parser.print_help()
+
+    # Convert list to format: [{"namespace": "...", "name": "..."}]
+    stop_operator_list = [dict(zip(['namespace', 'name'], item.split('/'))) for item in stop_operator_list]
+
     init_logger()
 
-    restore_backup(args.backup[0], restore_status_on)
+    stop_operators(stop_operator_list)
+    try:
+        restore_backup(args.backup[0], restore_status_on)
+    finally:
+        restart_operators(stop_operator_list)
 
 if __name__ == '__main__':
     main()
