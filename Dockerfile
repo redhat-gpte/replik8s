@@ -7,13 +7,10 @@ COPY . /tmp/src
 RUN rm -rf /tmp/src/.git* && \
     chown -R 1001 /tmp/src && \
     chgrp -R 0 /tmp/src && \
-    chmod -R g+w /tmp/src && \
-    install -d /tmp/scripts && \
-    cp /usr/libexec/s2i/run /tmp/scripts/run && \
-    (cp /tmp/src/.s2i/bin/run /tmp/scripts/run || :)
+    chmod -R g+w /tmp/src
 
 USER 1001
 
-RUN /usr/libexec/s2i/assemble
+RUN /tmp/src/.s2i/bin/assemble
 
-CMD ["/tmp/scripts/run"]
+CMD ["/usr/libexec/s2i/run"]
