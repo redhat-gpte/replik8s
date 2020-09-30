@@ -164,6 +164,13 @@ def restore_resource(resource, file_path, restore_status_on):
         logger.warning('Resource in %s missing metadata.name, ignoring.')
         return
     namespace = metadata.get('namespace', {})
+
+    # Remove dynamic fields
+    metadata.pop('creationTimestamp', None)
+    metadata.pop('resourceVersion', None)
+    metadata.pop('selfLink', None)
+    metadata.pop('uid', None)
+
     if api_version == 'v1':
         if namespace:
             restore_namespaced_core_v1_resource(namespace, kind, name, resource, file_path)
