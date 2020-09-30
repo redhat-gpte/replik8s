@@ -151,7 +151,7 @@ def restore_resource(resource, file_path, restore_status_on):
         return
 
     if api_version == 'v1' and kind == 'List':
-        for item in document.get('items', []):
+        for item in resource.get('items', []):
             restore_resource(item, file_path, restore_status_on)
         return
 
