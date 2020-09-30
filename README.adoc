@@ -1,12 +1,32 @@
 = Replik8s - Kubernetes real-time resource replicator
 
-...
+Replik8s watches resource definitions and keeps a record in a persistent volume.
 
 == Configuration
 
 --------
 apiVersion: v1
 kind: ConfigMap
+metadata:
+  name: example
+  labels:
+    replik8s.gpte.redhat.com/source: ''
+data:
+  spec: |
+    kubeConfig:
+      secret: test-kubeconfig
+    resources:
+    - apiVersion: anarchy.gpte.redhat.com/v1
+      kind: AnarchySubject
+      namespace: anarchy-operator
+    - apiVersion: anarchy.gpte.redhat.com/v1
+      kind: AnarchyAction
+      namespace: anarchy-operator
+    - apiVersion: poolboy.gpte.redhat.com/v1
+      kind: ResourceClaim
+    - apiVersion: poolboy.gpte.redhat.com/v1
+      kind: ResourceHandle
+      namespace: poolboy
 ...
 --------
 
