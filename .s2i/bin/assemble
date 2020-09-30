@@ -5,6 +5,6 @@ set -eo pipefail
 shopt -s dotglob
 
 mkdir /opt/app-root/bin || :
-cp /opt/app-root/src/util/restore.py /opt/app-root/bin/
+cp /tmp/src/util/restore.py /opt/app-root/bin/
 
 exec /usr/libexec/s2i/assemble
