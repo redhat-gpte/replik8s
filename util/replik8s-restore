@@ -45,6 +45,44 @@ def discover_api_group(api_group, version):
         api_groups[api_group] = {}
     api_groups[api_group][version] = group_info
 
+def get_resource_from_reference(reference, namespace):
+    api_version = reference['apiVersion']
+    kind = reference['kind']
+    name = reference['name']
+
+    # First check for namespaced resource first
+    if namespace:
+        try:
+            if api_version == 'v1':
+                read_method = getattr(core_v1_api, 'read_namespaced_' + inflection.underscore(kind))
+                return read_method(name, namespace)
+            elif '/' in api_version:
+                api_group, api_version = api_version.split('/')
+                plural = resource_kind_to_plural(api_group, api_version, kind)
+                return custom_objects_api.get_namespaced_custom_object(
+                    api_group, api_version, namespace, plural, name
+                )
+        except AttributeError:
+            pass
+        except kubernetes.client.rest.ApiException as e:
+            if e.status != 404:
+                raise
+    try:
+        if api_version == 'v1':
+            read_method = getattr(core_v1_api, 'read_' + inflection.underscore(kind))
+            return read_method(name)
+        elif '/' in api_version:
+            api_group, api_version = api_version.split('/')
+            plural = resource_kind_to_plural(api_group, api_version, kind)
+            return custom_objects_api.get_cluster_custom_object(
+                api_group, api_version, plural, name
+            )
+    except AttributeError:
+        pass
+    except kubernetes.client.rest.ApiException as e:
+        if e.status != 404:
+            raise
+
 def resource_kind_to_plural(api_group, version, kind):
     if not api_group:
         return inflection.pluralize(kind).lower()
@@ -58,14 +96,60 @@ def resource_kind_to_plural(api_group, version, kind):
             return resource['name']
     return None
 
-def restore_file(file_path, restore_status_on):
+def ref_print_format(ref):
+    if 'namespace' in ref:
+        return '{} {} {} in {}'.format(
+            ref['apiVersion'], ref['kind'], ref['name'], ref['namespace']
+        )
+    else:
+        return '{} {} {}'.format(
+            ref['apiVersion'], ref['kind'], ref['name']
+        )
+
+def resource_print_format(resource):
+    metadata = resource['metadata']
+    if 'namespace' in resource:
+        return '{} {} {} in {}'.format(
+            resource['apiVersion'], resource['kind'], metadata['name'], metadata['namespace']
+        )
+    else:
+        return '{} {} {}'.format(
+            resource['apiVersion'], resource['kind'], metadata['name']
+        )
+
+def process_backup_files(backup_path, handler):
+    logger.info('Restoring backup from %s', backup_path)
+    for root, dirs, files in os.walk(backup_path):
+        for filename in files:
+            if filename.endswith(".json") \
+            or filename.endswith(".yaml") \
+            or filename.endswith(".yml"):
+                 process_backup_file(os.path.join(root, filename), handler)
+
+def process_backup_file(file_path, handler):
     logger.info('Restore from %s', file_path)
     with open(file_path) as f:
         documents = yaml.safe_load_all(f)
         for document in documents:
-            restore_resource(document, file_path, restore_status_on)
+            process_backup_document(document, handler)
 
-def restore_namespaced_core_v1_resource(namespace, kind, name, resource, file_path):
+def process_backup_document(resource, handler):
+    api_version = resource.get('apiVersion')
+    if not api_version:
+        logger.warning('Resource in %s missing apiVersion, ignoring.')
+        return
+    kind = resource.get('kind')
+    if not kind:
+        logger.warning('Resource in %s missing kind, ignoring.')
+        return
+
+    if api_version == 'v1' and kind == 'List':
+        for item in resource.get('items', []):
+            handler(item)
+    else:
+        handler(item)
+
+def restore_namespaced_core_v1_resource(namespace, kind, name, resource):
     underscore_kind = inflection.underscore(kind)
     create_method = getattr(core_v1_api, 'create_namespaced_' + underscore_kind)
     delete_method = getattr(core_v1_api, 'delete_namespaced_' + underscore_kind)
@@ -84,7 +168,7 @@ def restore_namespaced_core_v1_resource(namespace, kind, name, resource, file_pa
     logger.info('Create %s %s in %s', kind, name, namespace)
     create_method(namespace, resource)
 
-def restore_cluster_core_v1_resource(kind, name, resource, file_path):
+def restore_cluster_core_v1_resource(kind, name, resource):
     underscore_kind = inflection.underscore(kind)
     create_method = getattr(core_v1_api, 'create_' + underscore_kind)
     delete_method = getattr(core_v1_api, 'delete_' + underscore_kind)
@@ -103,7 +187,41 @@ def restore_cluster_core_v1_resource(kind, name, resource, file_path):
     logger.info('Create %s %s', kind, name)
     create_method(resource)
 
-def restore_namespaced_custom_resource(api_group, api_version, namespace, kind, name, resource, file_path, restore_status_on):
+def restore_cluster_custom_resource(api_group, api_version, kind, name, resource, restore_status_on):
+    plural = resource_kind_to_plural(api_group, api_version, kind)
+    if not plural:
+        logger.warning('Unable to determine plural for %s/%s %s', api_group, api_version, kind)
+        return
+
+    try:
+        current = custom_objects_api.get_cluster_custom_object(
+            api_group, api_version, plural, name
+        )
+        logger.info('Delete current %s/%s %s %s', api_group, api_version, kind, name)
+        if current['metadata'].get('finalizers'):
+            custom_objects_api.patch_cluster_custom_object(
+                api_group, api_version, plural, name,
+                {'metadata': {'finalizers': []}}
+            )
+        custom_objects_api.delete_cluster_custom_object(
+            api_group, api_version, plural, name
+        )
+    except kubernetes.client.rest.ApiException as e:
+        if e.status != 404:
+            raise
+
+    logger.info('Create %s/%s %s %s', api_group, api_version, kind, name)
+    custom_objects_api.create_cluster_custom_object(
+        api_group, api_version, plural, resource
+    )
+
+    if '{}.{}'.format(plural, api_group) in restore_status_on \
+    and 'status' in resource:
+        custom_objects_api.patch_cluster_custom_object_status(
+            api_group, api_version, plural, name, resource
+        )
+
+def restore_namespaced_custom_resource(api_group, api_version, namespace, kind, name, resource, restore_status_on):
     plural = resource_kind_to_plural(api_group, api_version, kind)
     if not plural:
         logger.warning('Unable to determine plural for %s/%s %s', api_group, api_version, kind)
@@ -113,7 +231,7 @@ def restore_namespaced_custom_resource(api_group, api_version, namespace, kind, 
         current = custom_objects_api.get_namespaced_custom_object(
             api_group, api_version, namespace, plural, name
         )
-        logger.info('Delete current %s/%s %s %s', api_group, api_version, kind, name)
+        logger.info('Delete current %s/%s %s %s in %s', api_group, api_version, kind, name, namespace)
         if current['metadata'].get('finalizers'):
             custom_objects_api.patch_namespaced_custom_object(
                 api_group, api_version, namespace, plural, name,
@@ -126,7 +244,7 @@ def restore_namespaced_custom_resource(api_group, api_version, namespace, kind, 
         if e.status != 404:
             raise
 
-    logger.info('Create %s/%s %s %s', api_group, api_version, kind, name)
+    logger.info('Create %s/%s %s %s in %s', api_group, api_version, kind, name, namespace)
     custom_objects_api.create_namespaced_custom_object(
         api_group, api_version, namespace, plural, resource
     )
@@ -137,24 +255,9 @@ def restore_namespaced_custom_resource(api_group, api_version, namespace, kind, 
             api_group, api_version, namespace, plural, name, resource
         )
 
-def restore_cluster_custom_resource(api_group, api_version, kind, name, resource, file_path, restore_status_on):
-    logger.warning('Not implemented')
-
-def restore_resource(resource, file_path, restore_status_on):
+def restore_resource(resource, restore_status_on):
     api_version = resource.get('apiVersion')
-    if not api_version:
-        logger.warning('Resource in %s missing apiVersion, ignoring.')
-        return
     kind = resource.get('kind')
-    if not kind:
-        logger.warning('Resource in %s missing kind, ignoring.')
-        return
-
-    if api_version == 'v1' and kind == 'List':
-        for item in resource.get('items', []):
-            restore_resource(item, file_path, restore_status_on)
-        return
-
     metadata = resource.get('metadata', {})
     if not metadata:
         logger.warning('Resource in %s missing metadata, ignoring.')
@@ -167,32 +270,71 @@ def restore_resource(resource, file_path, restore_status_on):
 
     # Remove dynamic fields
     metadata.pop('creationTimestamp', None)
+    metadata.pop('ownerReferences', None)
     metadata.pop('resourceVersion', None)
     metadata.pop('selfLink', None)
     metadata.pop('uid', None)
 
     if api_version == 'v1':
         if namespace:
-            restore_namespaced_core_v1_resource(namespace, kind, name, resource, file_path)
+            restore_namespaced_core_v1_resource(namespace, kind, name, resource)
         else:
-            restore_cluster_core_v1_resource(kind, name, resource, file_path)
+            restore_cluster_core_v1_resource(kind, name, resource)
     elif '/' in api_version:
         api_group, api_version = api_version.split('/')
         if namespace:
-            restore_namespaced_custom_resource(api_group, api_version, namespace, kind, name, resource, file_path, restore_status_on)
+            restore_namespaced_custom_resource(api_group, api_version, namespace, kind, name, resource, restore_status_on)
         else:
-            restore_cluster_custom_resource(api_group, api_version, kind, name, resource, file_path, restore_status_on)
+            restore_cluster_custom_resource(api_group, api_version, kind, name, resource, restore_status_on)
     else:
         logger.warning('Unable to handle apiVersion %s', api_version)
 
-def restore_backup(backup_path, restore_status_on):
-    logger.info('Restoring backup from %s', backup_path)
-    for root, dirs, files in os.walk(backup_path):
-        for filename in files:
-            if filename.endswith(".json") \
-            or filename.endswith(".yaml") \
-            or filename.endswith(".yml"):
-                 restore_file(os.path.join(root, filename), restore_status_on)
+def restore_owner_references(resource):
+    api_version = resource.get('apiVersion')
+    kind = resource.get('kind')
+    metadata = resource.get('metadata', {})
+    name = metadata['name']
+    namespace = metadata.get('namespace')
+    owner_references = metadata.get('ownerReferences', [])
+
+    if not owner_references:
+        return
+    for owner_reference in owner_references:
+        owner = get_resource_from_reference(owner_reference, namespace)
+        if owner:
+            if hasattr(owner, 'metadata'):
+                owner_reference['uid'] = owner.metadata.uid
+            else:
+                owner_reference['uid'] = owner['metadata']['uid']
+        else:
+            logger.warning('Not restoring ownerReferences for %s, owner %s not found!',
+                resource_print_format(resource),
+                ref_print_format(owner_reference)
+            )
+            return
+
+    patch = {'metadata': {'ownerReferences': owner_references}}
+    if api_version == 'v1':
+        underscore_kind = inflection.underscore(kind)
+        if 'namespace' in metadata:
+            patch_method = getattr(core_v1_api, 'patch_' + underscore_kind)
+            patch_method(name, namespace, patch)
+        else:
+            patch_method = getattr(core_v1_api, 'patch_namespaced_' + underscore_kind)
+            patch_method(name, patch)
+    elif '/' in api_version:
+        api_group, api_version = api_version.split('/')
+        plural = resource_kind_to_plural(api_group, api_version, kind)
+        if 'namespace' in metadata:
+            custom_objects_api.patch_namespaced_custom_object(
+                api_group, api_version, namespace, plural, name, patch
+            )
+        else:
+            custom_objects_api.patch_cluster_custom_object(
+                api_group, api_version, plural, name, patch
+            )
+    else:
+        logger.warning('Unable to handle apiVersion %s', api_version)
 
 def stop_operators(operator_list):
     # Check that all operator deployments exist
@@ -248,6 +390,10 @@ def restart_operators(operator_list):
             'apps', 'v1', operator['namespace'], 'deployments', operator['name'],
             {"spec": {"replicas": operator['replicas']}}
         )
+
+def restore_backup(backup_path, restore_status_on):
+    process_backup_files(backup_path, lambda x : restore_resource(x, restore_status_on))
+    process_backup_files(backup_path, restore_owner_references)
 
 def main():
     import argparse
