@@ -42,3 +42,7 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+configs: {}
+
+kubeConfigs: {}
