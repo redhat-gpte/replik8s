@@ -863,21 +863,26 @@ def load_source_config_map(config_map, logger):
     except Replik8sConfigError as e:
         raise kopf.PermanentError('Source configmap load error: {}'.format(e))
 
-@kopf.on.create('', 'v1', 'configmaps', labels={replik8s_source_label: None})
+@kopf.on.startup()
+def configure(settings: kopf.OperatorSettings, **_):
+    # Disable scanning for CustomResourceDefinitions
+    settings.scanning.disabled = True
+
+@kopf.on.create('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
 def on_create_config_map(body, name, namespace, logger, **_):
     logger.info("ConfigMap source '%s' create", name)
     source = load_source_config_map(body, logger=logger)
     source.save_config(body)
     source.start_resources_watch()
 
-@kopf.on.resume('', 'v1', 'configmaps', labels={replik8s_source_label: None})
+@kopf.on.resume('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
 def on_config_map_resume(body, name, namespace, logger, **_):
     logger.info("ConfigMap source '%s' resume", name)
     source = load_source_config_map(body, logger=logger)
     source.save_config(body)
     source.start_resources_watch()
 
-@kopf.on.update('', 'v1', 'configmaps', labels={replik8s_source_label: None})
+@kopf.on.update('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
 def on_config_map_update(body, name, namespace, diff, logger, **_):
     # Ignore update if spec was not changed
     if 0 == len([x for x in diff if x[1] == ('data', 'spec')]):
@@ -886,7 +891,7 @@ def on_config_map_update(body, name, namespace, diff, logger, **_):
     source.save_config(body)
     source.start_resources_watch()
 
-@kopf.on.delete('', 'v1', 'configmaps', labels={replik8s_source_label: None})
+@kopf.on.delete('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
 def on_config_map_delete(body, name, namespace, logger, **_):
     logger.info("ConfigMap source '%s' delete", name)
     with source_lock:

@@ -45,3 +45,16 @@ Create the name of the service account to use
 {{      default "default" .Values.serviceAccount.name }}
 {{-   end -}}
 {{- end -}}
+
+{{/*
+Define the image to deploy
+*/}}
+{{- define "replik8s.image" -}}
+  {{- if eq .Values.image.tagOverride "-" -}}
+    {{- .Values.image.repository -}}
+  {{- else if .Values.image.tagOverride -}}
+    {{- printf "%s:%s" .Values.image.repository .Values.image.tagOverride -}}
+  {{- else -}}
+    {{- printf "%s:v%s" .Values.image.repository .Chart.AppVersion -}}
+  {{- end -}}
+{{- end -}}

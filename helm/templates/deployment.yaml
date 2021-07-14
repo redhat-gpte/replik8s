@@ -1,4 +1,4 @@
-{{- if .Values.deploy -}}
+{{- if .Values.deploy }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,18 +24,16 @@ spec:
       serviceAccountName: {{ include "replik8s.serviceAccountName" . }}
       containers:
       - name: replik8s
-        {{- if .Values.envVars }}
         env:
+        {{- with .Values.persistentVolume }}
+        - name: DATA_DIR
+          value: /data
+        {{- end }}
         {{- range $k, $v := .Values.envVars }}
         - name: {{ $k }}
           value: {{ $v }}
         {{- end }}
-        {{- end }}
-        {{- if .Values.image.repository | contains ":" }}
-        image: {{ .Values.image.repository }}
-        {{- else }}
-        image: {{ .Values.image.repository }}:v{{ .Chart.AppVersion }}
-        {{- end }}
+        image: "{{ include "replik8s.image" . }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         livenessProbe:
           httpGet:
@@ -43,16 +41,27 @@ spec:
             port: 8080
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
+        {{- with .Values.persistentVolume }}
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-    {{- with .Values.affinity }}
+      {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
-    {{- end }}
-    {{- with .Values.tolerations }}
+      {{- end }}
+      {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
-    {{- end }}
+      {{- end }}
+      {{- with .Values.persistentVolume }}
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: {{ include "replik8s.name" $ }}
+      {{- end }}
 {{- end -}}

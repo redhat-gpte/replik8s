@@ -1,2 +1,5 @@
-.odo
 *.swp
+.odo
+.odo/env
+.odo/odo-file-index.json
+kubeconfig.*

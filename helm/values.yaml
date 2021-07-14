@@ -2,7 +2,8 @@
 deploy: true
 
 image:
-  repository: quay.io/redhat-gpe/replik8s
+  tagOverride: ""
+  repository: quay.io/redhat-gpte/replik8s
   pullPolicy: IfNotPresent
 
 envVars: {}
@@ -15,6 +16,15 @@ openshift:
     create: false
     baseImage: quay.io/redhat-cop/python-kopf-s2i:latest
     gitRepo: https://github.com/jkupferer/replik8s.git
+
+persistentVolume:
+  create: true
+  spec:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
 
 replicaCount: 1
 

@@ -4,142 +4,118 @@ Replik8s watches resource definitions and keeps a record in a persistent volume.
 
 == Configuration
 
---------
+--------------------------------------------
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: example
+  name: operators
   labels:
     replik8s.gpte.redhat.com/source: ''
 data:
   spec: |
     kubeConfig:
-      secret: test-kubeconfig
+      secret: kubeconfig
     resources:
-    - apiVersion: anarchy.gpte.redhat.com/v1
-      kind: AnarchySubject
-      namespace: anarchy-operator
-    - apiVersion: anarchy.gpte.redhat.com/v1
-      kind: AnarchyAction
-      namespace: anarchy-operator
-    - apiVersion: poolboy.gpte.redhat.com/v1
-      kind: ResourceClaim
-    - apiVersion: poolboy.gpte.redhat.com/v1
-      kind: ResourceHandle
-      namespace: poolboy
+    - apiVersion: operators.coreos.com/v1alpha1
+      kind: CatalogSource
+    - apiVersion: operators.coreos.com/v1alpha1
+      kind: ClusterServiceVersion
+    - apiVersion: operators.coreos.com/v1alpha1
+      kind: InstallPlan
+    - apiVersion: operators.coreos.com/v1
+      kind: Operator
+    - apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+    - apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
 ...
---------
+--------------------------------------------
 
 == Using this Example with `odo`
 
 Ensure that the `python-kopf` image stream is available in the `openshift` namespace.
 
---------------------------------------------------------------------------------
-oc apply -f https://raw.githubusercontent.com/redhat-cop/containers-quickstarts/master/build-s2i-python-kopf/imagestream.yaml
---------------------------------------------------------------------------------
+. Create project namespace for replik8s development:
++
+-------------------------------
+odo project create replik8s-dev
+-------------------------------
 
-Create service, role, and role binding for `kopf-simple`:
-
---------------------------------------------------------------------------------
+. Create role for `replik8s`:
++
+------------------------------------------------------
 helm template --set deploy=false helm/ | oc apply -f -
+------------------------------------------------------
+
+. Grant `replik8s` access to default service account:
++
+--------------------------------------------------------------------------------
+oc policy add-role-to-user --role-namespace=$(oc project -q) replik8s -z default
 --------------------------------------------------------------------------------
 
-If replik8s is already deployed, scale the deployment to zero replicas.
+. Setup `odo` from devfile:
++
+---------------------------------
+odo create --devfile devfile.yaml
+---------------------------------
 
---------------------------------------------------------------------------------
-oc scale deployment replik8s --replicas=0
---------------------------------------------------------------------------------
-
-Setup `odo`:
-
--------------------------------
-odo create python-kopf replik8s
--------------------------------
-
-Push code with `odo`:
-
+. Push code with `odo`:
++
 --------
 odo push
 --------
 
-Patch the DeploymentConfig created by `odo` to use the `kopf-simple` service account:
+. Create `kubeconfig` secret with kubeconfig file for source cluster:
++
+---------------------------------------------------------------
+oc create secret generic kubeconfig --from-file=kubeconfig.yaml
+---------------------------------------------------------------
 
------------------------------------------------------------------------------
-oc patch dc/replik8s-app \
---patch '{"spec":{"template":{"spec":{"serviceAccountName":"replik8s"}}}}'
------------------------------------------------------------------------------
-
-Create a test config map:
-
---------------------------------
-oc create -f test/configmap.yaml
---------------------------------
-
-Get config name in `CONFIG_NAME` shell variable:
-
----------------------------------------------------------------------------------------------------------
-CONFIG_NAME=$(oc get configmap -l kopf-simple.example.com/config -o jsonpath='{.items[0].metadata.name}')
----------------------------------------------------------------------------------------------------------
-
-Verify secret creation:
-
--------------------------------
-oc describe secret $CONFIG_NAME
--------------------------------
-
-Check the operator logs:
-
---------------------------
-oc logs dc/kopf-simple-app
---------------------------
-
-Next try editing the config map to add another item to the `secretNames` list:
-
+. Create a config map:
++
 ------------------------------
-oc edit configmap $CONFIG_NAME
+oc create -f examples/operators.yaml
 ------------------------------
 
-Confirm that the secret was updated:
+. Check logs:
++
+-------
+odo log
+-------
 
--------------------------------
-oc describe secret $CONFIG_NAME
--------------------------------
+. Verify data collection:
++
+--------------------------------------------------------------------------------
+oc exec deployment/replik8s -- bash -c 'find /tmp/data*/replik8s-dev/babylon -type f'
+--------------------------------------------------------------------------------
 
-As an exercise, edit the provided example `operator/operator.py` to enable the configuration to specify the desired random string length.
-After each code change, use `odo push` to push changes into the deployment.
-
-When done, remove `odo` components with:
-
-----------------------
-odo delete kopf-simple
-----------------------
+. Cleanup
++
+----------
+odo delete
+----------
 
 == Building
 
-A Kustomize configuration for building this example in OpenShift is provided.
+The helm tomplate provided includes build configuration for OpenShift:
 
-Create image stream and build config:
-
-----------------------------------------------------------
-oc process --local -f build-template.yaml | oc apply -f -
-----------------------------------------------------------
-
-Build python-kopf-s2i-example from git source:
-
------------------------------
-oc start-build kopf-simple -F
------------------------------
-
-Or build python-kopf-s2i-example from local source:
-
--------------------------------------------------
-oc start-build kopf-simple --from-dir=../../.. -F
--------------------------------------------------
-
-Deploy the operator from your local build:
-
+. Create OpenShift BuildConfig and ImageStream
++
 --------------------------------------------------------------------------------
-oc process --local -f deploy-template.yaml \
--p IMAGE=$(oc get is kopf-simple -o jsonpath="{.status.tags[?(@.tag=='latest')].items[0].dockerImageReference}") \
+helm template helm/ --set openshift.build.create=true --set deploy=false | oc apply -f -
+--------------------------------------------------------------------------------
+
+. Build replik8s image:
++
+---------------------------------------------
+oc start-build replik8s --from-dir=. --follow
+---------------------------------------------
+
+. Deploy replik8s from build image:
++
+--------------------------------------------------------------------------------
+helm template helm \
+--set=image.tagOverride=- \
+--set=image.repository=$(oc get imagestream replik8s -o jsonpath='{.status.tags[?(@.tag=="latest")].items[0].dockerImageReference}') \
 | oc apply -f -
 --------------------------------------------------------------------------------
