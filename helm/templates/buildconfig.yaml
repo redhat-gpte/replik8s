@@ -16,7 +16,7 @@ spec:
   source:
     git:
       uri: {{ .Values.openshift.build.gitRepo }}
-      ref: master
+      ref: main
   strategy:
     sourceStrategy:
       from:
