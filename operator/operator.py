@@ -261,7 +261,7 @@ class Replik8sResourceWatch:
                     if event_obj['reason'] in ('Expired', 'Gone'):
                         self.source.logger.info(
                             'Restarting watch %s, reason %s',
-                            self.method_args, event_obj['reason']
+                            self.watch_method_args, event_obj['reason']
                         )
                         return
                     else:
