@@ -15,6 +15,9 @@ import threading
 import time
 import yaml
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 from base64 import b64decode
 from datetime import datetime
 from shutil import rmtree
