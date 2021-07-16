@@ -32,14 +32,14 @@ logging_format = '[%(asctime)s] %(threadName)s [%(levelname)s] - %(message)s'
 logging_level = os.environ.get('LOGGING_LEVEL', logging.INFO)
 operator_domain = os.environ.get('OPERATOR_DOMAIN', 'replik8s.gpte.redhat.com')
 replik8s_source_label = operator_domain + '/source'
-# Interval to index recovery point and prune resource data
-recovery_point_interval = int(os.environ.get('RECOVERY_POINT_INTERVAL', 300))
-# Maximum age for recovery point retention
-recovery_point_max_age = int(os.environ.get('RECOVERY_POINT_MAX_AGE', 3600))
+# Interval to index recovery point and prune resource data (default 15 minutes)
+recovery_point_interval = int(os.environ.get('RECOVERY_POINT_INTERVAL', 15 * 60))
+# Maximum age for recovery point retention (default 12 hours)
+recovery_point_max_age = int(os.environ.get('RECOVERY_POINT_MAX_AGE', 12 * 60 * 60))
 # Interval for finding and removing source data
-source_cleanup_interval = int(os.environ.get('SOURCE_CLEANUP_INTERVAL', 600))
+source_cleanup_interval = int(os.environ.get('SOURCE_CLEANUP_INTERVAL', 15 * 60))
 # Frequency to reset watch to refresh all resources
-resource_refresh_interval = int(os.environ.get('WATCH_RESET_INTERVAL', 600))
+resource_refresh_interval = int(os.environ.get('WATCH_RESET_INTERVAL', 15 * 60))
 
 # API server for client access
 api = flask.Flask('rest')
@@ -628,7 +628,7 @@ class Replik8sSource:
         except FileNotFoundError:
             pass
 
-    def copy_latest_to_dir(self, target_dir):
+    def copy_latest_to_dir(self, target_dir, logger):
         '''
         Copy all files, using hard links, from latest to a target directory.
         '''
@@ -642,19 +642,18 @@ class Replik8sSource:
                     )):
                         if plural_with_group.startswith('.'):
                             continue
-                        item_dir = os.path.join(
-                            target_dir, namespace_or_cluster, plural_with_group
-                        )
+                        src_dir = os.path.join(self.latest_dir, namespace_or_cluster, plural_with_group)
+                        dst_dir = os.path.join(target_dir, namespace_or_cluster, plural_with_group)
 
-                        makedirs_as_needed(item_dir)
+                        makedirs_as_needed(dst_dir)
 
                         try:
-                            for filename in os.listdir(item_dir):
+                            for filename in os.listdir(src_dir):
                                 if filename.endswith('.json'):
                                     try:
                                         os.link(
-                                            os.path.join(self.latest_dir, namespace_or_cluster, plural_with_group, filename),
-                                            os.path.join(item_dir, filename)
+                                            os.path.join(src_dir, filename),
+                                            os.path.join(dst_dir, filename)
                                         )
                                     except FileNotFoundError:
                                         pass
@@ -665,7 +664,7 @@ class Replik8sSource:
         except NotADirectoryError:
             pass
 
-    def make_recovery_point(self):
+    def make_recovery_point(self, logger):
         '''
         Copy current state of latest directory to make a recovery point.
 
@@ -676,8 +675,10 @@ class Replik8sSource:
         '''
         # FIXME? - Add optional support locking for recovery points creation?
         try:
-            recovery_point_dir = os.path.join(self.recovery_points_dir, datetime.utcnow().isoformat() + 'Z')
-            self.copy_latest_to_dir(recovery_point_dir)
+            recovery_point = datetime.utcnow().isoformat() + 'Z'
+            logger.info(f"Making recovery point {recovery_point}")
+            recovery_point_dir = os.path.join(self.recovery_points_dir, recovery_point)
+            self.copy_latest_to_dir(recovery_point_dir, logger)
         except Exception as e:
             self.logger.exception('Error while making recovery point!')
 
@@ -972,7 +973,7 @@ def main_loop():
             for source in Replik8sSource.sources.values():
                 if time.time() > source.last_refresh_time + source.refresh_interval:
                     source.refresh()
-                source.make_recovery_point()
+                source.make_recovery_point(logger)
                 source.prune_recovery_points()
                 source.clean_cache()
                 source.clean_latest()
