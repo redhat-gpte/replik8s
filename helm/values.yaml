@@ -3,7 +3,7 @@ deploy: true
 
 image:
   tagOverride: ""
-  repository: quay.io/redhat-gpte/replik8s
+  repository: quay.io/redhat-pfe/replik8s
   pullPolicy: IfNotPresent
 
 envVars: {}
