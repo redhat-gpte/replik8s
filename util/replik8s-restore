@@ -45,6 +45,15 @@ def discover_api_group(api_group, version):
         api_groups[api_group] = {}
     api_groups[api_group][version] = group_info
 
+def find_deployments(label_selector):
+    deployments = custom_objects_api.list_cluster_custom_object(
+        'apps', 'v1', 'deployments', label_selector=label_selector
+    ).get('items', [])
+    return [dict(
+        name = deployment['metadata']['name'],
+        namespace = deployment['metadata']['namespace'],
+    ) for deployment in deployments]
+
 def get_resource_from_reference(reference, namespace):
     api_version = reference['apiVersion']
     kind = reference['kind']
@@ -412,6 +421,10 @@ def main():
         '--stop-operators', metavar='NAMESPACE/DEPLOYMENT', type=str, nargs='*', action='append',
         help='List of operators to stop before restart and restart after completion.'
     )
+    parser.add_argument(
+        '--stop-operator-selectors', metavar='LABEL=VALUE', type=str, nargs='*', action='append',
+        help='List of operators to stop before restart and restart after completion.'
+    )
     args = parser.parse_args()
 
     if args.restore_status_on:
@@ -422,19 +435,33 @@ def main():
         restore_status_on = []
 
     if args.stop_operators:
-        stop_operator_list = [item for sublist in args.stop_operators for item in sublist]
+        stop_operator_args = [item for sublist in args.stop_operators for item in sublist]
     elif os.environ.get('STOP_OPERATORS'):
-        stop_operator_list = re.split(r'[ ,]+', os.environ['STOP_OPERATORS'])
+        stop_operator_args = re.split(r'[ ,]+', os.environ['STOP_OPERATORS'])
     else:
-        stop_operator_list = []
+        stop_operator_args = []
 
-    for operator_spec in stop_operator_list:
-        if not re.match(r'^[a-z0-9\-]+/[a-z0-9\-]+$', 'foo/bar'):
-            print("Invalid value for STOP_OPERATORS, must be in format NAMESPACE/NAME")
+    stop_operator_list = []
+    for stop_operator_arg in stop_operator_args:
+        if re.match(r'^[a-z0-9\-]+/[a-z0-9\-]+$', stop_operator_arg):
+            stop_operator_list.append(dict(zip(['namespace', 'name'], stop_operator_arg.split('/'))))
+        else:
+            print("Invalid value for STOP_OPERATORS, must be in format NAMESPACE/NAME or label selector")
             parser.print_help()
 
-    # Convert list to format: [{"namespace": "...", "name": "..."}]
-    stop_operator_list = [dict(zip(['namespace', 'name'], item.split('/'))) for item in stop_operator_list]
+    if args.stop_operator_selectors:
+        stop_operator_selector_args = [item for sublist in args.stop_operator_selectors for item in sublist]
+    elif os.environ.get('STOP_OPERATOR_SELECTORS'):
+        stop_operator_selector_args = re.split(r'[ ,]+', os.environ['STOP_OPERATOR_SELECTORS'])
+    else:
+        stop_operator_selector_args = []
+
+    for stop_operator_selector_arg in stop_operator_selector_args:
+        if re.match(r'^([a-z0-9.\-]+/)?[a-z0-9A-Z.\-]+(=[a-z0-9A-Z.\-]*)?$', stop_operator_selector_arg):
+            stop_operator_list.extend(find_deployments(label_selector=stop_operator_selector_arg))
+        else:
+            print("Invalid value for STOP_OPERATOR_SELECTORS, must be valid label selectors")
+            parser.print_help()
 
     init_logger()
 
