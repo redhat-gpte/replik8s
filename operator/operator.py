@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import asyncio
 import atexit
 import filelock
 import flask
@@ -33,19 +34,16 @@ logging_level = os.environ.get('LOGGING_LEVEL', logging.INFO)
 operator_domain = os.environ.get('OPERATOR_DOMAIN', 'replik8s.gpte.redhat.com')
 replik8s_source_label = operator_domain + '/source'
 # Interval to index recovery point and prune resource data (default 15 minutes)
-recovery_point_interval = int(os.environ.get('RECOVERY_POINT_INTERVAL', 15 * 60))
+default_recovery_point_interval = int(os.environ.get('RECOVERY_POINT_INTERVAL', 15 * 60))
 # Maximum age for recovery point retention (default 12 hours)
-recovery_point_max_age = int(os.environ.get('RECOVERY_POINT_MAX_AGE', 12 * 60 * 60))
-# Interval for finding and removing source data
-source_cleanup_interval = int(os.environ.get('SOURCE_CLEANUP_INTERVAL', 15 * 60))
+default_recovery_point_max_age = int(os.environ.get('RECOVERY_POINT_MAX_AGE', 12 * 60 * 60))
 # Frequency to reset watch to refresh all resources
-resource_refresh_interval = int(os.environ.get('WATCH_RESET_INTERVAL', 15 * 60))
+default_refresh_interval = int(os.environ.get('REFRESH_INTERVAL', 15 * 60))
+# Interval for finding and removing source data when source has been removed
+source_cleanup_interval = int(os.environ.get('SOURCE_CLEANUP_INTERVAL', 15 * 60))
 
 # API server for client access
 api = flask.Flask('rest')
-
-# Source lock used to control sources changing during recovery point processing
-source_lock = threading.Lock()
 
 # Temporary directory for working data
 tempdir = mkdtemp()
@@ -79,6 +77,10 @@ def removedirs_if_empty(path):
     except (FileNotFoundError, OSError):
         pass
 
+def run_api():
+    http_server = gevent.pywsgi.WSGIServer(('', 5000), api)
+    http_server.serve_forever()
+
 def touch(path):
     '''
     Update timestamp on file or create empty file at path
@@ -88,6 +90,21 @@ def touch(path):
     except FileNotFoundError:
         with open(path, 'a') as f:
             pass
+
+class InfiniteRelativeBackoff:
+    def __init__(self, initial_delay=0.1, scaling_factor=2, maximum=60):
+        self.initial_delay = initial_delay
+        self.scaling_factor = scaling_factor
+        self.maximum = maximum
+
+    def __iter__(self):
+        delay = self.initial_delay
+        while True:
+            if delay > self.maximum:
+                yield self.maximum
+            else:
+                yield delay
+                delay *= self.scaling_factor
 
 class Replik8sConfigError(Exception):
     pass
@@ -342,15 +359,18 @@ class Replik8sSource:
     # List of Replik8sSources
     sources = {}
 
+    # Source lock used to control sources changing during recovery point processing
+    source_lock = threading.Lock()
+
     @classmethod
-    def get(cls, metadata=None, namespace=None, name=None):
+    def get(cls, namespace=None, name=None):
         '''
         Get source by metadata or name + namespace
         '''
         if metadata:
             namespace = metadata['namespace']
             name = metadata['name']
-        key = namespace + '/' + name
+        key = (namespace, name)
         return cls.sources.get(key, None)
 
     @classmethod
@@ -361,56 +381,80 @@ class Replik8sSource:
         return [ source for source in cls.sources.values() if source.match_token(token) ]
 
     @classmethod
-    def new_or_update(cls, metadata, spec):
+    def load_config_map(cls, body, labels, logger, name, namespace, **_):
+        key = (namespace, name)
+        source = cls.sources.get(key)
+
+        spec_yaml = body.get('data', {}).get('spec')
+        if not spec_yaml:
+            raise kopf.PermanentError('Source configmap missing spec data')
+
+        try:
+            spec = yaml.safe_load(spec_yaml)
+        except yaml.parser.ParserError as e:
+            raise kopf.PermanentError(f"YAML parse error loading configmap spec data: {e}")
+
+        with cls.source_lock:
+            return cls.new_or_update(
+                logger = logger,
+                api_version = 'v1',
+                kind = 'ConfigMap',
+                labels = labels,
+                name = name,
+                namespace = namespace,
+                spec = spec
+            )
+
+    @classmethod
+    def new_or_update(cls, logger, api_version, kind, labels, name, namespace, spec):
         '''
         Register new source or update currently registered source.
         '''
-        namespace = metadata['namespace']
-        name = metadata['name']
-        key = namespace + '/' + name
+        key = (namespace, name)
         source = cls.sources.get(key, None)
         if source:
             source.__update(spec=spec)
         else:
-            source = cls(namespace=namespace, name=name, spec=spec)
+            source = cls(
+                api_version = api_version,
+                kind = kind,
+                labels = labels,
+                logger = logger,
+                name = name,
+                namespace = namespace,
+                spec = spec
+            )
             cls.sources[key] = source
         return source
 
     @classmethod
-    def remove(cls, metadata):
+    def remove(cls, name, namespace):
         '''
         Remove source and stop watches for source.
         '''
-        namespace = metadata['namespace']
-        name = metadata['name']
-        key = namespace + '/' + name
-        source = cls.sources.get(key, None)
-        if source:
-            del cls.sources[key]
-            source.stop_resources_watch()
+        key = (namespace, name)
+        with cls.source_lock:
+            source = cls.sources.get(key, None)
+            if source:
+                del cls.sources[key]
+                source.stop_resources_watch()
+                rmtree(self.basedir)
 
-    def __init__(self, namespace, name, spec):
+    def __init__(self, api_version, kind, labels, logger, name, namespace, spec):
+        self.api_version = api_version
+        self.kind = kind
+        self.labels = labels
+        self.logger = logger
         self.name = name
         self.namespace = namespace
         self.spec = spec
+
         # Replik8sResourceWatch objects for this source
         self.api_groups = dict()
+        self.lock = threading.Lock()
         self.watches = list()
-        self.last_refresh_time = time.time()
-        self.refresh_interval = resource_refresh_interval
         self.__sanity_check()
-        self.__init_logger()
         self.__init_kube_api()
-
-    def __init_logger(self):
-        handler = logging.StreamHandler()
-        handler.setLevel(logging_level)
-        handler.setFormatter(
-            logging.Formatter(logging_format)
-        )
-        self.logger = logging.getLogger(self.name)
-        self.logger.addHandler(handler)
-        self.logger.propagate = False
 
     def __init_kube_api(self):
         if self.kube_config_secret:
@@ -482,6 +526,18 @@ class Replik8sSource:
         return os.path.join(self.basedir, 'recovery-points')
 
     @property
+    def recovery_point_interval(self):
+        return float(self.spec.get('recoveryPointInterval', default_recovery_point_interval))
+
+    @property
+    def recovery_point_max_age(self):
+        return float(self.spec.get('recoveryPointMaxAge', default_recovery_point_max_age))
+
+    @property
+    def refresh_interval(self):
+        return float(self.spec.get('refreshInterval', default_refresh_interval))
+
+    @property
     def resources(self):
         return self.spec.get('resources', None)
 
@@ -512,7 +568,7 @@ class Replik8sSource:
                                 filepath = os.path.join(cache_subdir, filename)
                                 fstat = os.stat(filepath)
                                 if stat.S_ISREG(fstat.st_mode) \
-                                and time.time() > fstat.st_mtime + resource_refresh_interval:
+                                and time.time() > fstat.st_mtime + self.refresh_interval:
                                     self.logger.debug('removing cache file %s', filepath)
                                     os.unlink(filepath)
                         except NotADirectoryError:
@@ -548,7 +604,7 @@ class Replik8sSource:
                                 lock = filelock.FileLock(filepath + '.lock')
                                 with lock:
                                     fstat = os.stat(filepath)
-                                    if time.time() > fstat.st_mtime + 2 * resource_refresh_interval:
+                                    if time.time() > fstat.st_mtime + 2 * self.refresh_interval:
                                         self.logger.warning('removing orphaned resource json %s', filepath)
                                         os.unlink(filepath)
                         except NotADirectoryError:
@@ -623,8 +679,8 @@ class Replik8sSource:
                 dstat = os.stat(recovery_point_dir)
                 if not stat.S_ISDIR(dstat.st_mode):
                     continue
-                if time.time() > dstat.st_mtime + recovery_point_max_age:
-                    rmtree(self.basedir)
+                if time.time() > dstat.st_mtime + self.recovery_point_max_age:
+                    rmtree(recovery_point_dir)
         except FileNotFoundError:
             pass
 
@@ -725,29 +781,30 @@ class Replik8sSource:
                 return resource['name']
         raise Replik8sConfigError('unable to find kind {} in {}/{}', kind, api_group, version)
 
-    def save_config(self, body):
+    def save_config(self):
         '''
-        Save config definition from Kopf body object.
+        Save config definition from Kopf object.
         '''
         resource = dict(
-            apiVersion = body['apiVersion'],
-            kind = body['kind'],
+            apiVersion = self.api_version,
+            kind = self.kind,
             metadata = dict(
-                name = body['metadata']['name'],
-                namespace = body['metadata']['namespace'],
-                labels = body['metadata']['labels'],
+                name = self.name,
+                namespace = self.namespace,
             )
         )
+        if self.labels:
+            resource['metadata']['labels'] = {**self.labels}
 
-        if body['apiVersion'] == 'v1' and body['kind'] == 'ConfigMap':
-            resource['data'] = { k: v for k, v in body['data'].items() if k != 'status'}
+        if self.kind == 'ConfigMap':
+            resource['data'] = dict(spec = json.dumps(self.spec))
         else:
-            resource['spec'] = body['spec']
+            resource['spec'] = {**self.spec}
 
         makedirs_as_needed(self.basedir)
 
         with open(os.path.join(self.basedir, 'config.yaml'), 'w') as f:
-            f.write("#{}Z\n".format(datetime.utcnow().isoformat()))
+            f.write(f"#{datetime.utcnow().isoformat()}Z\n")
             f.write(yaml.safe_dump(resource, default_flow_style=False))
 
     def start_resource_watch(self, resource):
@@ -780,126 +837,74 @@ class Replik8sSource:
         with open(self.kube_config_path, 'wb') as fh:
             fh.write(b64decode(secret.data['kubeconfig.yaml']))
 
-def get_secret(name, namespace):
-    '''
-    Read namespaced secret, return None if not found.
-    '''
-    try:
-        return core_v1_api.read_namespaced_secret(name, namespace)
-    except kubernetes.client.rest.ApiException as e:
-        if e.status == 404:
-            return None
-        raise
-
-def cleanup_missing_sources(logger):
-    '''
-    Check source directories for deleted source config and cleanup as needed.
-    '''
-    for namespace in os.listdir(datadir):
-        if namespace.startswith('.'):
-            continue
-        try:
-            for name in os.listdir(os.path.join(datadir, namespace)):
-                if name.startswith('.'):
-                    continue
-                source_dir = os.path.join(datadir, namespace, name)
-
-                # Do not check sources for cleanup unless they have been around
-                # for a while.
-                source_dir_stat = os.stat(os.path.join(source_dir))
-                if not stat.S_ISDIR(source_dir_stat.st_mode) \
-                or time.time() < source_dir_stat.st_mtime + source_cleanup_interval:
-                    continue
-
-                # Check for recent activity before performing cleanup. This allows for
-                # time for watch activity for the source to finish.
-                try:
-                    watch_active_stat = os.stat(os.path.join(source_dir, '.watchactive'))
-                    if time.time() < watch_active_stat.st_mtime + source_cleanup_interval:
-                        continue
-                except FileNotFoundError:
-                    logger.warning('did not find %s/.watchactive', source_dir)
-                    continue
-
-                config_resource = None
-                source_config_yaml = os.path.join(source_dir, 'config.yaml')
-                try:
-                    with open(source_config_yaml) as f:
-                        config_from_file = yaml.safe_load(f)
-                        name = config_from_file['metadata']['name']
-                        namespace = config_from_file['metadata']['namespace']
-                        if config_from_file['apiVersion'] == 'v1' \
-                        and config_from_file['kind'] == 'ConfigMap':
-                            config_resource = core_v1_api.read_namespaced_config_map(name, namespace)
-                        else:
-                            logger.warning('config in %s must be ConfigMap', source_config_yaml)
-                            continue
-                except FileNotFoundError:
-                    logger.warning('no config found in %s', source_dir)
-                    continue
-                except yaml.parser.ParserError as e:
-                    logger.warning('unable to load config found in %s: %s', source_dir, e)
-                    continue
-                except kubernetes.client.rest.ApiException as e:
-                    if e.status != 404:
-                        logger.warning('error reading ConfigMap %s in %s: %s', name, namespace, e)
-                        continue
-
-                if not config_resource:
-                    # Config resource not found in cluster, safe to cleanup
-                    rmtree(source_dir)
-
-        except NotADirectoryError:
-            pass
-
-def load_source_config_map(config_map, logger):
-    try:
-        metadata = config_map['metadata']
-        if not 'data' in config_map \
-        or 'spec' not in config_map['data']:
-            raise Replik8sConfigError('missing spec data')
-        try:
-            spec = yaml.safe_load(config_map['data']['spec'])
-        except yaml.parser.ParserError as e:
-            raise Replik8sConfigError('unable to load config YAML: {0}'.format(e))
-        with source_lock:
-            return Replik8sSource.new_or_update(metadata=metadata, spec=spec)
-    except Replik8sConfigError as e:
-        raise kopf.PermanentError('Source configmap load error: {}'.format(e))
-
 @kopf.on.startup()
-def configure(settings: kopf.OperatorSettings, **_):
+def startup(settings: kopf.OperatorSettings, **_):
+    # Never give up from network errors
+    settings.networking.error_backoffs = InfiniteRelativeBackoff()
+
+    # Only create events for warnings and errors
+    settings.posting.level = logging.WARNING
+
     # Disable scanning for CustomResourceDefinitions
     settings.scanning.disabled = True
 
-@kopf.on.create('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def on_create_config_map(body, name, namespace, logger, **_):
-    logger.info("ConfigMap source '%s' create", name)
-    source = load_source_config_map(body, logger=logger)
-    source.save_config(body)
+    # Start api
+    threading.Thread(
+        name = 'api',
+        target = run_api,
+        daemon = True,
+    ).start()
+
+
+@kopf.on.create('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+def config_create(**kwargs):
+    source = Replik8sSource.load_config_map(**kwargs)
+    source.save_config()
     source.start_resources_watch()
 
-@kopf.on.resume('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def on_config_map_resume(body, name, namespace, logger, **_):
-    logger.info("ConfigMap source '%s' resume", name)
-    source = load_source_config_map(body, logger=logger)
-    source.save_config(body)
+@kopf.on.resume('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+def config_resume(**kwargs):
+    source = Replik8sSource.load_config_map(**kwargs)
+    source.save_config()
     source.start_resources_watch()
 
-@kopf.on.update('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def on_config_map_update(body, name, namespace, diff, logger, **_):
+@kopf.on.update('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+def config_update(diff, **kwargs):
     # Ignore update if spec was not changed
     if 0 == len([x for x in diff if x[1] == ('data', 'spec')]):
         return
-    source = load_source_config_map(body, logger=logger)
-    source.save_config(body)
+    source = Replik8sSource.load_config_map(**kwargs)
+    source.save_config()
     source.start_resources_watch()
 
-@kopf.on.delete('', 'v1', 'configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def on_config_map_delete(body, name, namespace, logger, **_):
-    logger.info("ConfigMap source '%s' delete", name)
-    with source_lock:
-        Replik8sSource.remove(body['metadata'])
+@kopf.on.delete('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+def config_delete(name, namespace, **_):
+    Replik8sSource.remove(name=name, namespace=namespace)
+
+@kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+async def config_refresh(stopped, **kwargs):
+    source = Replik8sSource.load_config_map(**kwargs)
+    try:
+        while not stopped:
+            await asyncio.sleep(source.refresh_interval)
+            with source.lock:
+                source.refresh()
+    except asyncio.CancelledError:
+        pass
+
+@kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+async def config_manage_recovery_points(stopped, **kwargs):
+    source = Replik8sSource.load_config_map(**kwargs)
+    try:
+        while not stopped:
+            await asyncio.sleep(source.recovery_point_interval)
+            with source.lock:
+                source.make_recovery_point()
+                source.prune_recovery_points()
+                source.clean_cache()
+                source.clean_latest()
+    except asyncio.CancelledError:
+        pass
 
 def get_auth_token():
     auth_header = flask.request.headers.get('Authorization', '')
@@ -954,46 +959,3 @@ def get_recovery_point(source_namespace, source_name, recovery_point):
         metadata=dict(),
         items=items
     ))
-
-def main_loop():
-    last_source_cleanup = time.time()
-
-    logging_handler = logging.StreamHandler()
-    logging_handler.setLevel(logging_level)
-    logging_handler.setFormatter(
-        logging.Formatter(logging_format)
-    )
-    logger = logging.getLogger('main')
-    logger.addHandler(logging_handler)
-    logger.propagate = False
-
-    while True:
-        time.sleep(recovery_point_interval)
-        with source_lock:
-            for source in Replik8sSource.sources.values():
-                if time.time() > source.last_refresh_time + source.refresh_interval:
-                    source.refresh()
-                source.make_recovery_point(logger)
-                source.prune_recovery_points()
-                source.clean_cache()
-                source.clean_latest()
-        if time.time() > last_source_cleanup + source_cleanup_interval:
-            cleanup_missing_sources(logger)
-
-def main():
-    main_loop_thread = threading.Thread(
-        name = 'main',
-        target = main_loop,
-    )
-    main_loop_thread.daemon = True
-    main_loop_thread.start()
-
-    http_server = gevent.pywsgi.WSGIServer(('', 5000), api)
-    http_server.serve_forever()
-
-if __name__ == '__main__':
-    main()
-else:
-    main_thread = threading.Thread(name='main', target=main)
-    main_thread.daemon = True
-    main_thread.start()
