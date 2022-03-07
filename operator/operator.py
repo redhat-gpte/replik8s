@@ -302,6 +302,9 @@ class Replik8sResourceWatch:
                 and e.status == 403:
                     self.source.logger.exception("Forbidden response on watch: %s", e)
                     time.sleep(60)
+                elif isinstance(e, kubernetes.client.rest.ApiException) \
+                and e.status == 410:
+                    self.source.logger.debug("Watch expired, restarting")
                 else:
                     self.source.logger.exception("Error in watch loop: %s", e)
                     time.sleep(30)
