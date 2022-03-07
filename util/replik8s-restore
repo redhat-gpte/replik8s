@@ -156,7 +156,7 @@ def process_backup_document(resource, handler):
         for item in resource.get('items', []):
             handler(item)
     else:
-        handler(item)
+        handler(resource)
 
 def restore_namespaced_core_v1_resource(namespace, kind, name, resource):
     underscore_kind = inflection.underscore(kind)

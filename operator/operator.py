@@ -29,8 +29,6 @@ filelock._logger = logging.getLogger('filelock')
 filelock._logger.propagate = False
 
 datadir = os.environ.get('DATA_DIR', mkdtemp(prefix='data'))
-logging_format = '[%(asctime)s] %(threadName)s [%(levelname)s] - %(message)s'
-logging_level = os.environ.get('LOGGING_LEVEL', logging.INFO)
 operator_domain = os.environ.get('OPERATOR_DOMAIN', 'replik8s.gpte.redhat.com')
 replik8s_source_label = operator_domain + '/source'
 # Interval to index recovery point and prune resource data (default 15 minutes)
@@ -291,7 +289,7 @@ class Replik8sResourceWatch:
                 try:
                     self.handle_resource_event(event)
                 except Exception as e:
-                    self.source.logger.exception("Error handling event %s", event)
+                    self.source.logger.exception("Error handling event")
 
     def watch_loop(self):
         while True:
@@ -300,13 +298,13 @@ class Replik8sResourceWatch:
             except Exception as e:
                 if isinstance(e, kubernetes.client.rest.ApiException) \
                 and e.status == 403:
-                    self.source.logger.exception("Forbidden response on watch: %s", e)
+                    self.source.logger.exception("Forbidden response on watch")
                     time.sleep(60)
                 elif isinstance(e, kubernetes.client.rest.ApiException) \
                 and e.status == 410:
                     self.source.logger.debug("Watch expired, restarting")
                 else:
-                    self.source.logger.exception("Error in watch loop: %s", e)
+                    self.source.logger.exception("Error in watch loop")
                     time.sleep(30)
 
     def write_resource(
@@ -384,7 +382,7 @@ class Replik8sSource:
         return [ source for source in cls.sources.values() if source.match_token(token) ]
 
     @classmethod
-    def load_config_map(cls, body, labels, logger, name, namespace, **_):
+    def load_config_map(cls, body, labels, name, namespace, **_):
         key = (namespace, name)
         source = cls.sources.get(key)
 
@@ -399,7 +397,6 @@ class Replik8sSource:
 
         with cls.source_lock:
             return cls.new_or_update(
-                logger = logger,
                 api_version = 'v1',
                 kind = 'ConfigMap',
                 labels = labels,
@@ -409,7 +406,7 @@ class Replik8sSource:
             )
 
     @classmethod
-    def new_or_update(cls, logger, api_version, kind, labels, name, namespace, spec):
+    def new_or_update(cls, api_version, kind, labels, name, namespace, spec):
         '''
         Register new source or update currently registered source.
         '''
@@ -422,7 +419,6 @@ class Replik8sSource:
                 api_version = api_version,
                 kind = kind,
                 labels = labels,
-                logger = logger,
                 name = name,
                 namespace = namespace,
                 spec = spec
@@ -443,14 +439,19 @@ class Replik8sSource:
                 source.stop_resources_watch()
                 rmtree(self.basedir)
 
-    def __init__(self, api_version, kind, labels, logger, name, namespace, spec):
+    def __init__(self, api_version, kind, labels, name, namespace, spec):
         self.api_version = api_version
         self.kind = kind
         self.labels = labels
-        self.logger = logger
         self.name = name
         self.namespace = namespace
         self.spec = spec
+
+        # Use kopf local object logger to log without attempting to create events
+        self.logger = kopf.LocalObjectLogger(
+            body = self.to_dict(),
+            settings = kopf.OperatorSettings(),
+        )
 
         # Replik8sResourceWatch objects for this source
         self.api_groups = dict()
@@ -548,12 +549,12 @@ class Replik8sSource:
     def watch_activity_touchpoint(self):
         return os.path.join(self.basedir, '.watchactive')
 
-    def clean_cache(self):
+    def clean_cache(self, logger):
         '''
         Remove old data from cache
         '''
         try:
-            self.logger.debug('cache clean for %s/%s', self.namespace, self.name)
+            logger.debug('cache clean for %s/%s', self.namespace, self.name)
             for namespace_or_cluster in os.listdir(self.cache_dir):
                 if namespace_or_cluster.startswith('.'):
                     continue
@@ -572,7 +573,7 @@ class Replik8sSource:
                                 fstat = os.stat(filepath)
                                 if stat.S_ISREG(fstat.st_mode) \
                                 and time.time() > fstat.st_mtime + self.refresh_interval:
-                                    self.logger.debug('removing cache file %s', filepath)
+                                    logger.debug('removing cache file %s', filepath)
                                     os.unlink(filepath)
                         except NotADirectoryError:
                             continue
@@ -582,12 +583,12 @@ class Replik8sSource:
         except FileNotFoundError:
             pass
 
-    def clean_latest(self):
+    def clean_latest(self, logger):
         '''
         Remove old data from latest
         '''
         try:
-            self.logger.debug('clean of latest for %s/%s', self.namespace, self.name)
+            logger.debug('clean of latest for %s/%s', self.namespace, self.name)
             for namespace_or_cluster in os.listdir(self.latest_dir):
                 if namespace_or_cluster.startswith('.'):
                     continue
@@ -608,7 +609,7 @@ class Replik8sSource:
                                 with lock:
                                     fstat = os.stat(filepath)
                                     if time.time() > fstat.st_mtime + 2 * self.refresh_interval:
-                                        self.logger.warning('removing orphaned resource json %s', filepath)
+                                        logger.warning('removing orphaned resource json %s', filepath)
                                         os.unlink(filepath)
                         except NotADirectoryError:
                             pass
@@ -671,7 +672,7 @@ class Replik8sSource:
     def get_recovery_point_items(self, recovery_point):
         return self.get_items_from_dir(os.path.join(self.recovery_point_dir, recovery_point))
 
-    def prune_recovery_points(self):
+    def prune_recovery_points(self, logger):
         '''
         Remove recovery points based on age
         '''
@@ -737,9 +738,9 @@ class Replik8sSource:
             recovery_point = datetime.utcnow().isoformat() + 'Z'
             logger.info(f"Making recovery point {recovery_point}")
             recovery_point_dir = os.path.join(self.recovery_points_dir, recovery_point)
-            self.copy_latest_to_dir(recovery_point_dir, logger)
+            self.copy_latest_to_dir(target_dir=recovery_point_dir, logger=logger)
         except Exception as e:
-            self.logger.exception('Error while making recovery point!')
+            logger.exception('Error while making recovery point!')
 
     def match_token(self, token):
         '''
@@ -788,27 +789,10 @@ class Replik8sSource:
         '''
         Save config definition from Kopf object.
         '''
-        resource = dict(
-            apiVersion = self.api_version,
-            kind = self.kind,
-            metadata = dict(
-                name = self.name,
-                namespace = self.namespace,
-            )
-        )
-        if self.labels:
-            resource['metadata']['labels'] = {**self.labels}
-
-        if self.kind == 'ConfigMap':
-            resource['data'] = dict(spec = json.dumps(self.spec))
-        else:
-            resource['spec'] = {**self.spec}
-
         makedirs_as_needed(self.basedir)
-
         with open(os.path.join(self.basedir, 'config.yaml'), 'w') as f:
             f.write(f"#{datetime.utcnow().isoformat()}Z\n")
-            f.write(yaml.safe_dump(resource, default_flow_style=False))
+            f.write(yaml.safe_dump(self.to_dict(), default_flow_style=False))
 
     def start_resource_watch(self, resource):
         try:
@@ -830,6 +814,23 @@ class Replik8sSource:
         self.logger.info('stop resource watches for %s', self.name)
         for watch in self.watches:
             watch.stop = True
+
+    def to_dict(self):
+        ret = dict(
+            apiVersion = self.api_version,
+            kind = self.kind,
+            metadata = dict(
+                name = self.name,
+                namespace = self.namespace,
+            )
+        )
+        if self.labels:
+            ret['metadata']['labels'] = {**self.labels}
+        if self.kind == 'ConfigMap':
+            ret['data'] = dict(spec = json.dumps(self.spec))
+        else:
+            ret['spec'] = {**self.spec}
+        return ret
 
     def write_kube_config(self):
         secret = core_v1_api.read_namespaced_secret(self.kube_config_secret, self.namespace)
@@ -896,16 +897,16 @@ async def config_refresh(stopped, **kwargs):
         pass
 
 @kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
-async def config_manage_recovery_points(stopped, **kwargs):
+async def config_manage_recovery_points(logger, stopped, **kwargs):
     source = Replik8sSource.load_config_map(**kwargs)
     try:
         while not stopped:
             await asyncio.sleep(source.recovery_point_interval)
             with source.lock:
-                source.make_recovery_point()
-                source.prune_recovery_points()
-                source.clean_cache()
-                source.clean_latest()
+                source.make_recovery_point(logger=logger)
+                source.prune_recovery_points(logger=logger)
+                source.clean_cache(logger=logger)
+                source.clean_latest(logger=logger)
     except asyncio.CancelledError:
         pass
 
