@@ -52,6 +52,40 @@ def check_restore_status(api_group, kind, plural, restore_status_on):
             return True
     return False
 
+def delete_resource(resource):
+    api_version = resource['apiVersion']
+    kind = resource['kind']
+    name = resource['metadata']['name']
+    namespace = resource['metadata'].get('namespace')
+
+    if namespace:
+        try:
+            if api_version == 'v1':
+                delete_method = getattr(core_v1_api, 'delete_namespaced_' + inflection.underscore(kind))
+                return delete_method(name, namespace)
+            elif '/' in api_version:
+                api_group, api_version = api_version.split('/')
+                plural = resource_kind_to_plural(api_group, api_version, kind)
+                return custom_objects_api.delete_namespaced_custom_object(
+                    api_group, api_version, namespace, plural, name
+                )
+        except kubernetes.client.rest.ApiException as e:
+            if e.status != 404:
+                raise
+    try:
+        if api_version == 'v1':
+            delete_method = getattr(core_v1_api, 'delete_' + inflection.underscore(kind))
+            return delete_method(name)
+        elif '/' in api_version:
+            api_group, api_version = api_version.split('/')
+            plural = resource_kind_to_plural(api_group, api_version, kind)
+            return custom_objects_api.delete_cluster_custom_object(
+                api_group, api_version, plural, name
+            )
+    except kubernetes.client.rest.ApiException as e:
+        if e.status != 404:
+            raise
+
 def discover_api_group(api_group, version):
     resp = api_client.call_api(
         '/apis/{}/{}'.format(api_group,version), 'GET',
@@ -198,6 +232,8 @@ def restore_cluster_core_v1_resource(kind, name, resource, restore_status):
             raise
     logger.info('Create %s %s', kind, name)
     create_method(resource)
+    if 'deletionTimestamp' in resource['metadata']:
+        delete_method(name)
     if restore_status and 'status' in resource:
         patch_status_method = getattr(core_v1_api, f"patch_{underscore_kind}_status")
         patch_status_method(name, resource)
@@ -220,6 +256,8 @@ def restore_namespaced_core_v1_resource(kind, name, namespace, resource, restore
             raise
     logger.info('Create %s %s in %s', kind, name, namespace)
     create_method(namespace, resource)
+    if 'deletionTimestamp' in resource['metadata']:
+        delete_method(name, namespace)
     if restore_status and 'status' in resource:
         patch_status_method = getattr(core_v1_api, f"patch_namespaced_{underscore_kind}_status")
         patch_status_method(name, namespace, resource)
@@ -247,6 +285,10 @@ def restore_cluster_custom_resource(api_group, api_version, kind, name, plural, 
         api_group, api_version, plural, resource
     )
 
+    if 'deletionTimestamp' in resource['metadata']:
+        custom_objects_api.delete_cluster_custom_object(
+            api_group, api_version, plural, name
+        )
     if restore_status and 'status' in resource:
         custom_objects_api.patch_cluster_custom_object_status(
             api_group, api_version, plural, name, resource
@@ -275,6 +317,10 @@ def restore_namespaced_custom_resource(api_group, api_version, kind, name, names
         api_group, api_version, namespace, plural, resource
     )
 
+    if 'deletionTimestamp' in resource['metadata']:
+        custom_objects_api.delete_namespaced_custom_object(
+            api_group, api_version, namespace, plural, name
+        )
     if restore_status and 'status' in resource:
         custom_objects_api.patch_namespaced_custom_object_status(
             api_group, api_version, namespace, plural, name, resource
@@ -419,10 +465,11 @@ def restore_owner_references(resource):
             else:
                 owner_reference['uid'] = owner['metadata']['uid']
         else:
-            logger.warning('Not restoring ownerReferences for %s, owner %s not found!',
+            logger.warning('Reverting restore of %s, owner %s not found!',
                 resource_print_format(resource),
                 ref_print_format(owner_reference)
             )
+            delete_resource(resource=resource)
             return
 
     patch = {'metadata': {'ownerReferences': owner_references}}
