@@ -121,12 +121,9 @@ class Replik8sResourceWatch:
             (self.api_group, self.api_version) = (None, api_version)
         self.namespace = resource.get('namespace', None)
         self.kind = resource.get('kind', None)
-        self.__sanity_check()
-        self.plural = self.source.resource_kind_to_plural(self.api_group, self.api_version, self.kind)
-        if self.api_group:
-            self.__init_custom_resource_watcher()
-        else:
-            self.__init_core_resource_watcher()
+        self.plural = None
+        self.healthy = None
+        self.error = None
 
     def __init_core_resource_watcher(self):
         try:
@@ -241,9 +238,23 @@ class Replik8sResourceWatch:
         removedirs_if_empty(resource_latest_dir)
 
     def start(self):
+        try:
+            self.__sanity_check()
+            self.plural = self.source.resource_kind_to_plural(self.api_group, self.api_version, self.kind)
+            if self.api_group:
+                self.__init_custom_resource_watcher()
+            else:
+                self.__init_core_resource_watcher()
+        except Exception as e:
+            self.source.logger.error('Config error in resources: %s', e)
+            self.healthy = False
+            self.error = str(e)
+            return
+
         self.source.logger.info(
-            "start resource watch %s/%s for %s", self.source.namespace, self.source.name, self.name
+            "Start resource watch %s/%s for %s", self.source.namespace, self.source.name, self.name
         )
+
         self.stop = False
         self.thread = threading.Thread(
             name = os.path.join(self.source.name, self.name),
@@ -287,6 +298,7 @@ class Replik8sResourceWatch:
                         )
             else:
                 try:
+                    self.healthy = True
                     self.handle_resource_event(event)
                 except Exception as e:
                     self.source.logger.exception("Error handling event")
@@ -295,17 +307,19 @@ class Replik8sResourceWatch:
         while True:
             try:
                 self.watch()
-            except Exception as e:
-                if isinstance(e, kubernetes.client.rest.ApiException) \
-                and e.status == 403:
-                    self.source.logger.exception("Forbidden response on watch")
-                    time.sleep(60)
-                elif isinstance(e, kubernetes.client.rest.ApiException) \
-                and e.status == 410:
+            except kubernetes.client.rest.ApiException as e:
+                if e.status == 410:
                     self.source.logger.debug("Watch expired, restarting")
                 else:
-                    self.source.logger.exception("Error in watch loop")
-                    time.sleep(30)
+                    self.error = str(e)
+                    self.healthy = False
+                    self.source.logger.exception("API error on watch")
+                    time.sleep(60)
+            except Exception as e:
+                self.error = str(e)
+                self.healthy = False
+                self.source.logger.exception("Error in watch loop")
+                time.sleep(30)
 
     def write_resource(
         self, resource,
@@ -741,6 +755,7 @@ class Replik8sSource:
             self.copy_latest_to_dir(target_dir=recovery_point_dir, logger=logger)
         except Exception as e:
             logger.exception('Error while making recovery point!')
+        self.update_recovery_point_status()
 
     def match_token(self, token):
         '''
@@ -795,17 +810,15 @@ class Replik8sSource:
             f.write(yaml.safe_dump(self.to_dict(), default_flow_style=False))
 
     def start_resource_watch(self, resource):
-        try:
-            watch = Replik8sResourceWatch(source=self, resource=resource)
-            self.watches.append(watch)
-            watch.start()
-        except Replik8sConfigError as e:
-            self.logger.warn('Config error in resources: %s', e)
+        watch = Replik8sResourceWatch(source=self, resource=resource)
+        self.watches.append(watch)
+        watch.start()
 
     def start_resources_watch(self):
         self.last_refresh_time = time.time()
         if self.watches:
             self.stop_resources_watch()
+        self.watches = []
         self.logger.debug('starting resources watch for %s/%s', self.namespace, self.name)
         for resource in self.resources:
             self.start_resource_watch(resource)
@@ -831,6 +844,52 @@ class Replik8sSource:
         else:
             ret['spec'] = {**self.spec}
         return ret
+
+    def update_recovery_point_status(self):
+        try:
+            if self.kind == 'ConfigMap':
+                config_map = core_v1_api.read_namespaced_config_map(self.name, self.namespace)
+                status = yaml.safe_load(config_map.data['status']) if 'status' in config_map.data else {}
+                status['recoveryPoints'] = self.recovery_points
+                config_map.data['status'] = yaml.safe_dump(status, default_flow_style=False)
+                core_v1_api.replace_namespaced_config_map(self.name, self.namespace, config_map)
+            else:
+                # FIXME? - Future support for custom resource kind?
+                pass
+        except kubernetes.client.rest.ApiException as e:
+            # Conflict updating status just means it will be picked up in another pass
+            if e.status != 409:
+                raise
+
+    def update_watch_status(self):
+        watch_status = []
+        for watch in self.watches:
+            watch_status_item = {
+                "healthy": watch.healthy,
+                "kind": watch.kind,
+            }
+            if watch.api_group:
+                watch_status_item['apiVersion'] = f"{watch.api_group}/{watch.api_version}"
+            else:
+                watch_status_item['apiVersion'] = f"{watch.api_version}"
+            if not watch.healthy:
+                watch_status_item['error'] = watch.error
+            watch_status.append(watch_status_item)
+        try:
+            if self.kind == 'ConfigMap':
+                config_map = core_v1_api.read_namespaced_config_map(self.name, self.namespace)
+                status = yaml.safe_load(config_map.data['status']) if 'status' in config_map.data else {}
+                if watch_status != status.get('watches'):
+                    status['watches'] = watch_status
+                    config_map.data['status'] = yaml.safe_dump(status, default_flow_style=False)
+                    core_v1_api.replace_namespaced_config_map(self.name, self.namespace, config_map)
+            else:
+                # FIXME? - Future support for custom resource kind?
+                pass
+        except kubernetes.client.rest.ApiException as e:
+            # Conflict updating status just means it will be picked up in another pass
+            if e.status != 409:
+                raise
 
     def write_kube_config(self):
         secret = core_v1_api.read_namespaced_secret(self.kube_config_secret, self.namespace)
@@ -907,6 +966,17 @@ async def config_manage_recovery_points(logger, stopped, **kwargs):
                 source.prune_recovery_points(logger=logger)
                 source.clean_cache(logger=logger)
                 source.clean_latest(logger=logger)
+    except asyncio.CancelledError:
+        pass
+
+@kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
+async def config_update_watch_status(logger, stopped, **kwargs):
+    source = Replik8sSource.load_config_map(**kwargs)
+    try:
+        while not stopped:
+            await asyncio.sleep(10)
+            with source.lock:
+                source.update_watch_status()
     except asyncio.CancelledError:
         pass
 

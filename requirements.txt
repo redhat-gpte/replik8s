@@ -3,4 +3,3 @@ Flask==1.1.2
 gevent==21.1.2
 inflection==0.5.1
 itsdangerous==1.1.0
-pyYAML==5.4.1
