@@ -636,6 +636,8 @@ def main():
             restore_status_on = restore_status_on,
         )
     finally:
+        print("Pausing for 60 seconds after restore for etcd to settle")
+        time.sleep(60)
         restart_operators(stop_operator_list)
 
 if __name__ == '__main__':
