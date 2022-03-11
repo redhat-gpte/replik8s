@@ -533,9 +533,12 @@ class Replik8sSource:
     @property
     def recovery_points(self):
         try:
-            return [
-                d for d in os.listdir(self.recovery_points_dir) if not d.startswith('.')
-            ]
+            ret = []
+            for d in os.listdir(self.recovery_points_dir):
+                if not d.startswith('.'):
+                    ret.append(d)
+            ret.sort()
+            return ret
         except FileNotFoundError:
             return []
 
