@@ -564,7 +564,6 @@ def restore_backup(backup_path, create_namespaces, restore_status_on):
     process_backup_files(backup_path, restore_owner_references)
 
 def main():
-    import argparse
     backup_path = os.environ.get('BACKUP_PATH', '')
 
     parser = argparse.ArgumentParser(description='Restore resources from backup.')
