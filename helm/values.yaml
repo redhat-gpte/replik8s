@@ -18,8 +18,8 @@ nameOverride: ""
 openshift:
   build:
     create: false
-    baseImage: quay.io/redhat-cop/python-kopf-s2i:latest
-    gitRepo: https://github.com/jkupferer/replik8s.git
+    baseImage: quay.io/redhat-cop/python-kopf-s2i:v1.35
+    gitRepo: https://github.com/rhpds/replik8s.git
 
 persistentVolume:
   create: true
