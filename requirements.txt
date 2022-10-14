@@ -1,3 +1,6 @@
+aiofiles==22.1.0
+aioshutil==1.1
+asgiref==3.5.2
 filelock==3.8.0
 Flask==2.2.2
 gevent==22.8.0

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import aiofiles.os
 import asyncio
 import atexit
 import filelock
@@ -8,7 +9,7 @@ import gevent.pywsgi
 import inflection
 import json
 import kopf
-import kubernetes
+import kubernetes_asyncio
 import logging
 import os
 import stat
@@ -19,10 +20,15 @@ import yaml
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+from aioshutil import rmtree
 from base64 import b64decode
 from datetime import datetime
-from shutil import rmtree
 from tempfile import mkdtemp
+from typing import Mapping
+
+from infinite_relative_backoff import InfiniteRelativeBackoff
+
+async_utime = aiofiles.os.wrap(os.utime)
 
 # Disable noisy filelock logger
 filelock._logger = logging.getLogger('filelock')
@@ -40,38 +46,29 @@ default_refresh_interval = int(os.environ.get('REFRESH_INTERVAL', 15 * 60))
 # Interval for finding and removing source data when source has been removed
 source_cleanup_interval = int(os.environ.get('SOURCE_CLEANUP_INTERVAL', 15 * 60))
 
+core_v1_api = custom_objects_api = None
+
 # API server for client access
 api = flask.Flask('rest')
 
 # Temporary directory for working data
 tempdir = mkdtemp()
-def remove_tempdir():
-    rmtree(tempdir)
-atexit.register(remove_tempdir)
 
-if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount'):
-    kubernetes.config.load_incluster_config()
-else:
-    kubernetes.config.load_kube_config()
-
-core_v1_api = kubernetes.client.CoreV1Api()
-custom_objects_api = kubernetes.client.CustomObjectsApi()
-
-def makedirs_as_needed(path):
+async def makedirs_as_needed(path):
     '''
     Make directory and any required parent directories
     '''
     try:
-        os.makedirs(path)
+        await aiofiles.os.makedirs(path)
     except FileExistsError:
         pass
 
-def removedirs_if_empty(path):
+async def removedirs_if_empty(path):
     '''
     Make directory and any required parent directories
     '''
     try:
-        os.removedirs(path)
+        await aiofiles.os.removedirs(path)
     except (FileNotFoundError, OSError):
         pass
 
@@ -79,30 +76,15 @@ def run_api():
     http_server = gevent.pywsgi.WSGIServer(('', 5000), api)
     http_server.serve_forever()
 
-def touch(path):
+async def touch(path):
     '''
     Update timestamp on file or create empty file at path
     '''
     try:
-        os.utime(path)
+        await async_utime(path)
     except FileNotFoundError:
         with open(path, 'a') as f:
             pass
-
-class InfiniteRelativeBackoff:
-    def __init__(self, initial_delay=0.1, scaling_factor=2, maximum=60):
-        self.initial_delay = initial_delay
-        self.scaling_factor = scaling_factor
-        self.maximum = maximum
-
-    def __iter__(self):
-        delay = self.initial_delay
-        while True:
-            if delay > self.maximum:
-                yield self.maximum
-            else:
-                yield delay
-                delay *= self.scaling_factor
 
 class Replik8sConfigError(Exception):
     pass
@@ -167,11 +149,12 @@ class Replik8sResourceWatch:
         else:
             return self.plural
 
-    def handle_resource_event(self, event):
+    async def handle_resource_event(self, event):
         event_type = event['type']
         resource = event['object']
-        if hasattr(resource, 'to_dict'):
-            resource = resource.to_dict()
+
+        if not isinstance(resource, Mapping):
+            resource = core_v1_api.api_client.sanitize_for_serialization(resource)
 
         resource_kind = resource['kind']
         resource_metadata = resource['metadata']
@@ -206,12 +189,12 @@ class Replik8sResourceWatch:
         )
 
         if event_type == 'DELETED':
-            self.remove_resource_from_latest(
+            await self.remove_resource_from_latest(
                 resource_latest_dir=resource_latest_dir,
                 resource_latest_filepath=resource_latest_filepath
             )
         else:
-            self.write_resource(
+            await self.write_resource(
                 resource=resource,
                 resource_cache_dir=resource_cache_dir,
                 resource_cache_filepath=resource_cache_filepath,
@@ -219,28 +202,38 @@ class Replik8sResourceWatch:
                 resource_latest_filepath=resource_latest_filepath
             )
 
-    def refresh(self):
+    async def refresh(self):
         self.source.logger.info('refreshing %s/%s %s', self.source.namespace, self.source.name, self.name)
-        for resource in self.watch_method(*self.watch_method_args).get('items', []):
-            self.handle_resource_event({
-                'type': 'REFRESH',
-                'object': resource,
-            })
+        _continue = None
+        while True:
+            resource_list = await self.watch_method(
+                *self.watch_method_args,
+                _continue = _continue,
+                limit = 50,
+            )
+            for resource in resource_list.get('items', []):
+                await self.handle_resource_event({
+                    'type': 'REFRESH',
+                    'object': resource,
+                })
+            _continue = resource_list['metadata'].get('continue')
+            if not _continue:
+                break
 
-    def remove_resource_from_latest(self, resource_latest_dir, resource_latest_filepath):
+    async def remove_resource_from_latest(self, resource_latest_dir, resource_latest_filepath):
         '''
         Remove resource file from latest, if found.
         '''
         try:
-            os.unlink(resource_latest_filepath)
+            await aiofiles.os.unlink(resource_latest_filepath)
         except FileNotFoundError:
             pass
-        removedirs_if_empty(resource_latest_dir)
+        await removedirs_if_empty(resource_latest_dir)
 
-    def start(self):
+    async def start(self):
         try:
             self.__sanity_check()
-            self.plural = self.source.resource_kind_to_plural(self.api_group, self.api_version, self.kind)
+            self.plural = await self.source.resource_kind_to_plural(self.api_group, self.api_version, self.kind)
             if self.api_group:
                 self.__init_custom_resource_watcher()
             else:
@@ -254,26 +247,16 @@ class Replik8sResourceWatch:
         self.source.logger.info(
             "Start resource watch %s/%s for %s", self.source.namespace, self.source.name, self.name
         )
+        self.task = asyncio.create_task(self.watch_loop())
 
-        self.stop = False
-        self.thread = threading.Thread(
-            name = os.path.join(self.source.name, self.name),
-            target = self.watch_loop
-        )
-        self.thread.daemon = True
-        self.thread.start()
-
-    def watch(self):
-        stream = kubernetes.watch.Watch().stream(self.watch_method, *self.watch_method_args)
+    async def watch(self):
+        stream = kubernetes_asyncio.watch.Watch().stream(self.watch_method, *self.watch_method_args)
         watch_start_time = time.time()
 
         # Update modification timestamp on watch touchpoint
-        touch(self.source.watch_activity_touchpoint)
+        await touch(self.source.watch_activity_touchpoint)
 
-        for event in stream:
-            if self.stop:
-                return
-
+        async for event in stream:
             # Handle event object
             event_obj = event['object']
             if event['type'] == 'ERROR' \
@@ -299,15 +282,17 @@ class Replik8sResourceWatch:
             else:
                 try:
                     self.healthy = True
-                    self.handle_resource_event(event)
+                    await self.handle_resource_event(event)
                 except Exception as e:
                     self.source.logger.exception("Error handling event")
 
-    def watch_loop(self):
+    async def watch_loop(self):
         while True:
             try:
-                self.watch()
-            except kubernetes.client.rest.ApiException as e:
+                await self.watch()
+            except asyncio.CancelledError:
+                return
+            except kubernetes_asyncio.client.exceptions.ApiException as e:
                 if e.status == 410:
                     self.source.logger.debug("Watch expired, restarting")
                 else:
@@ -321,7 +306,7 @@ class Replik8sResourceWatch:
                 self.source.logger.exception("Error in watch loop")
                 time.sleep(30)
 
-    def write_resource(
+    async def write_resource(
         self, resource,
         resource_cache_dir, resource_cache_filepath,
         resource_latest_dir, resource_latest_filepath
@@ -333,39 +318,40 @@ class Replik8sResourceWatch:
 
         cache_file_exists = False
         try:
-            cache_stat = os.stat(resource_cache_filepath)
+            cache_stat = await aiofiles.os.stat(resource_cache_filepath)
             cache_file_exists = True
 
             # Update timestamp on cache file to track presence
-            os.utime(resource_cache_filepath)
+            await async_utime(resource_cache_filepath)
 
             # Nothing else to do if cache file for version exists and inode
             # matches latest file.
-            latest_stat = os.stat(resource_latest_filepath)
+            latest_stat = await aiofiles.os.stat(resource_latest_filepath)
             if cache_stat.st_ino == latest_stat.st_ino:
                 return
         except FileNotFoundError:
             pass
 
         if not cache_file_exists:
-            makedirs_as_needed(resource_cache_dir)
+            await makedirs_as_needed(resource_cache_dir)
             # Write then rename to guarantee atomic operation
             with open(resource_tmp_filepath, 'w') as f:
                 f.write(json.dumps(resource))
-                os.rename(resource_tmp_filepath, resource_cache_filepath)
+                await aiofiles.os.rename(resource_tmp_filepath, resource_cache_filepath)
 
-        makedirs_as_needed(resource_latest_dir)
+        await makedirs_as_needed(resource_latest_dir)
 
         # Create hard-link in latest to cache in two steps because link does
         # not support overwrite.
         try:
-            os.link(resource_cache_filepath, resource_tmp_filepath)
+            await aiofiles.os.link(resource_cache_filepath, resource_tmp_filepath)
         except FileExistsError:
             # If temporary link location then must have been interrupted,
             # remove and retry.
-            os.unlink(resource_tmp_filepath)
-            os.link(resource_cache_filepath, resource_tmp_filepath)
+            await aiofiles.os.unlink(resource_tmp_filepath)
+            await aiofiles.os.link(resource_cache_filepath, resource_tmp_filepath)
 
+        # No async file lock capability!
         lock = filelock.FileLock(resource_latest_filepath + '.lock')
         with lock:
             os.rename(resource_tmp_filepath, resource_latest_filepath)
@@ -375,7 +361,7 @@ class Replik8sSource:
     sources = {}
 
     # Source lock used to control sources changing during recovery point processing
-    source_lock = threading.Lock()
+    source_lock = asyncio.Lock()
 
     @classmethod
     def get(cls, namespace=None, name=None):
@@ -389,14 +375,17 @@ class Replik8sSource:
         return cls.sources.get(key, None)
 
     @classmethod
-    def get_by_token(cls, token):
+    async def get_by_token(cls, token):
         '''
         Get sources matching auth token
         '''
-        return [ source for source in cls.sources.values() if source.match_token(token) ]
+        ret = []
+        for source in cls.sources.values():
+            if await source.match_token(token):
+                ret.append(source)
 
     @classmethod
-    def load_config_map(cls, body, labels, name, namespace, **_):
+    async def load_config_map(cls, body, labels, name, namespace, **_):
         key = (namespace, name)
         source = cls.sources.get(key)
 
@@ -409,8 +398,8 @@ class Replik8sSource:
         except yaml.parser.ParserError as e:
             raise kopf.PermanentError(f"YAML parse error loading configmap spec data: {e}")
 
-        with cls.source_lock:
-            return cls.new_or_update(
+        async with cls.source_lock:
+            return await cls.new_or_update(
                 api_version = 'v1',
                 kind = 'ConfigMap',
                 labels = labels,
@@ -420,7 +409,7 @@ class Replik8sSource:
             )
 
     @classmethod
-    def new_or_update(cls, api_version, kind, labels, name, namespace, spec):
+    async def new_or_update(cls, api_version, kind, labels, name, namespace, spec):
         '''
         Register new source or update currently registered source.
         '''
@@ -437,11 +426,12 @@ class Replik8sSource:
                 namespace = namespace,
                 spec = spec
             )
+            await source.__init_kube_api()
             cls.sources[key] = source
         return source
 
     @classmethod
-    def remove(cls, name, namespace):
+    async def remove(cls, name, namespace):
         '''
         Remove source and stop watches for source.
         '''
@@ -451,7 +441,13 @@ class Replik8sSource:
             if source:
                 del cls.sources[key]
                 source.stop_resources_watch()
-                rmtree(self.basedir)
+                await rmtree(self.basedir)
+
+    @classmethod
+    async def stop_all_watches(cls):
+        for source in sources.values():
+            for watch in source.watch():
+                watch.task.cancel()
 
     def __init__(self, api_version, kind, labels, name, namespace, spec):
         self.api_version = api_version
@@ -469,17 +465,18 @@ class Replik8sSource:
 
         # Replik8sResourceWatch objects for this source
         self.api_groups = dict()
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
         self.watches = list()
         self.__sanity_check()
-        self.__init_kube_api()
 
-    def __init_kube_api(self):
+    async def __init_kube_api(self):
         if self.kube_config_secret:
-            self.write_kube_config()
-            self.api_client = kubernetes.config.new_client_from_config(config_file=self.kube_config_path)
-            self.core_v1_api = kubernetes.client.CoreV1Api(api_client=self.api_client)
-            self.custom_objects_api = kubernetes.client.CustomObjectsApi(api_client=self.api_client)
+            await self.write_kube_config()
+            self.api_client = await kubernetes_asyncio.config.new_client_from_config(
+                config_file = self.kube_config_path
+            )
+            self.core_v1_api = kubernetes_asyncio.client.CoreV1Api(api_client=self.api_client)
+            self.custom_objects_api = kubernetes_asyncio.client.CustomObjectsApi(api_client=self.api_client)
         else:
             self.api_client = core_v1_api.api_client
             self.core_v1_api = core_v1_api
@@ -531,18 +528,6 @@ class Replik8sSource:
             return self.kube_config.get('secret', None)
 
     @property
-    def recovery_points(self):
-        try:
-            ret = []
-            for d in os.listdir(self.recovery_points_dir):
-                if not d.startswith('.'):
-                    ret.append(d)
-            ret.sort()
-            return ret
-        except FileNotFoundError:
-            return []
-
-    @property
     def recovery_points_dir(self):
         return os.path.join(self.basedir, 'recovery-points')
 
@@ -566,62 +551,63 @@ class Replik8sSource:
     def watch_activity_touchpoint(self):
         return os.path.join(self.basedir, '.watchactive')
 
-    def clean_cache(self, logger):
+    async def clean_cache(self, logger):
         '''
         Remove old data from cache
         '''
         try:
             logger.debug('cache clean for %s/%s', self.namespace, self.name)
-            for namespace_or_cluster in os.listdir(self.cache_dir):
+            for namespace_or_cluster in await aiofiles.os.listdir(self.cache_dir):
                 if namespace_or_cluster.startswith('.'):
                     continue
                 try:
-                    for plural_with_group in os.listdir(os.path.join(
-                        self.cache_dir, namespace_or_cluster
-                    )):
+                    for plural_with_group in await aiofiles.os.listdir(
+                        os.path.join(self.cache_dir, namespace_or_cluster)
+                    ):
                         if plural_with_group.startswith('.'):
                             continue
                         cache_subdir = os.path.join(self.cache_dir, namespace_or_cluster, plural_with_group)
                         try:
-                            for filename in os.listdir(cache_subdir):
+                            for filename in await aiofiles.os.listdir(cache_subdir):
                                 if filename.startswith('.'):
                                     continue
                                 filepath = os.path.join(cache_subdir, filename)
-                                fstat = os.stat(filepath)
+                                fstat = await aiofiles.os.stat(filepath)
                                 if stat.S_ISREG(fstat.st_mode) \
                                 and time.time() > fstat.st_mtime + self.refresh_interval:
                                     logger.debug('removing cache file %s', filepath)
-                                    os.unlink(filepath)
+                                    await aiofiles.os.unlink(filepath)
                         except NotADirectoryError:
                             continue
-                        removedirs_if_empty(cache_subdir)
+                        await removedirs_if_empty(cache_subdir)
                 except NotADirectoryError:
                     pass
         except FileNotFoundError:
             pass
 
-    def clean_latest(self, logger):
+    async def clean_latest(self, logger):
         '''
         Remove old data from latest
         '''
         try:
             logger.debug('clean of latest for %s/%s', self.namespace, self.name)
-            for namespace_or_cluster in os.listdir(self.latest_dir):
+            for namespace_or_cluster in await aiofiles.os.listdir(self.latest_dir):
                 if namespace_or_cluster.startswith('.'):
                     continue
                 try:
-                    for plural_with_group in os.listdir(os.path.join(
+                    for plural_with_group in await aiofiles.os.listdir(os.path.join(
                         self.latest_dir, namespace_or_cluster
                     )):
                         if plural_with_group.startswith('.'):
                             continue
                         latest_subdir = os.path.join(self.latest_dir, namespace_or_cluster, plural_with_group)
                         try:
-                            for filename in os.listdir(latest_subdir):
+                            for filename in await aiofiles.os.listdir(latest_subdir):
                                 if filename.startswith('.') \
                                 or not filename.endswith('.json'):
                                     continue
                                 filepath = os.path.join(latest_subdir, filename)
+                                # No async file lock capability!
                                 lock = filelock.FileLock(filepath + '.lock')
                                 with lock:
                                     fstat = os.stat(filepath)
@@ -630,43 +616,48 @@ class Replik8sSource:
                                         os.unlink(filepath)
                         except NotADirectoryError:
                             pass
-                        removedirs_if_empty(latest_subdir)
+                        await removedirs_if_empty(latest_subdir)
                 except NotADirectoryError:
                     pass
         except FileNotFoundError:
             pass
 
-    def discover_api_group(self, api_group, version):
-        resp = self.api_client.call_api(
-            '/apis/{}/{}'.format(api_group,version),
-            'GET',
+    async def discover_api_group(self, api_group, version):
+        resp = await self.custom_objects_api.api_client.call_api(
+            method = 'GET',
+            resource_path = f"/apis/{api_group}/{version}",
             auth_settings=['BearerToken'],
-            response_type='object'
+            response_types_map = {
+                200: "object",
+            }
         )
         group_info = resp[0]
         if api_group not in self.api_groups:
             self.api_groups[api_group] = {}
         self.api_groups[api_group][version] = group_info
 
-    def get_items_from_dir(self, directory):
+    async def get_items_from_dir(self, directory):
         try:
             items = []
-            for namespace_or_cluster in os.listdir(self.latest_dir):
+            for namespace_or_cluster in await aiofiles.os.listdir(directory):
                 if namespace_or_cluster.startswith('.'):
                     continue
                 try:
-                    for plural_with_group in os.listdir(os.path.join(
-                        self.latest_dir, namespace_or_cluster
-                    )):
+                    for plural_with_group in await aiofiles.os.listdir(
+                        os.path.join(
+                            self.latest_dir, namespace_or_cluster
+                        )
+                    ):
                         if plural_with_group.startswith('.'):
                             continue
-                        latest_subdir = os.path.join(self.latest_dir, namespace_or_cluster, plural_with_group)
+                        subdir = os.path.join(directory, namespace_or_cluster, plural_with_group)
                         try:
-                            for filename in os.listdir(latest_subdir):
+                            for filename in await aiofiles.os.listdir(subdir):
                                 if filename.startswith('.') \
                                 or not filename.endswith('.json'):
                                     continue
                                 filepath = os.path.join(latest_subdir, filename)
+                                # No async file lock capability!
                                 lock = filelock.FileLock(filepath + '.lock')
                                 with lock:
                                     try:
@@ -676,53 +667,63 @@ class Replik8sSource:
                                         pass
                         except NotADirectoryError:
                             pass
-                        removedirs_if_empty(latest_subdir)
+                        await removedirs_if_empty(latest_subdir)
                 except NotADirectoryError:
                     pass
             return items
         except FileNotFoundError:
             return None
 
-    def get_latest_items(self):
-        return self.get_items_from_dir(self.latest_dir) or []
+    async def get_latest_items(self):
+        return await self.get_items_from_dir(self.latest_dir) or []
 
-    def get_recovery_point_items(self, recovery_point):
-        return self.get_items_from_dir(os.path.join(self.recovery_point_dir, recovery_point))
+    async def get_recovery_points(self):
+        try:
+            ret = []
+            for d in await aiofiles.os.listdir(self.recovery_points_dir):
+                if not d.startswith('.'):
+                    ret.append(d)
+            ret.sort()
+            return ret
+        except FileNotFoundError:
+            return []
 
-    def prune_recovery_points(self, logger):
+    async def get_recovery_point_items(self, recovery_point):
+        return await self.get_items_from_dir(os.path.join(self.recovery_point_dir, recovery_point))
+
+    async def prune_recovery_points(self, logger):
         '''
         Remove recovery points based on age
         '''
         try:
-            for recovery_point_dir in os.listdir(self.recovery_points_dir):
-                if recovery_point_dir.startswith('.'):
-                    continue
-                dstat = os.stat(recovery_point_dir)
+            recovery_points = await self.get_recovery_points()
+            for recovery_point_dir in recovery_points:
+                dstat = await aiofiles.os.stat(recovery_point_dir)
                 if not stat.S_ISDIR(dstat.st_mode):
                     continue
                 if time.time() > dstat.st_mtime + self.recovery_point_max_age:
-                    rmtree(recovery_point_dir)
+                    await rmtree(recovery_point_dir)
         except FileNotFoundError:
             pass
 
-    def copy_latest_to_dir(self, target_dir, logger):
+    async def copy_latest_to_dir(self, target_dir, logger):
         '''
         Copy all files, using hard links, from latest to a target directory.
         '''
         try:
-            for namespace_or_cluster in os.listdir(self.latest_dir):
+            for namespace_or_cluster in await aiofiles.os.listdir(self.latest_dir):
                 if namespace_or_cluster.startswith('.'):
                     continue
                 try:
-                    for plural_with_group in os.listdir(os.path.join(
-                        self.latest_dir, namespace_or_cluster
-                    )):
+                    for plural_with_group in await aiofiles.os.listdir(
+                        os.path.join(self.latest_dir, namespace_or_cluster)
+                    ):
                         if plural_with_group.startswith('.'):
                             continue
                         src_dir = os.path.join(self.latest_dir, namespace_or_cluster, plural_with_group)
                         dst_dir = os.path.join(target_dir, namespace_or_cluster, plural_with_group)
 
-                        makedirs_as_needed(dst_dir)
+                        await makedirs_as_needed(dst_dir)
 
                         try:
                             for filename in os.listdir(src_dir):
@@ -741,7 +742,7 @@ class Replik8sSource:
         except NotADirectoryError:
             pass
 
-    def make_recovery_point(self, logger):
+    async def make_recovery_point(self, logger):
         '''
         Copy current state of latest directory to make a recovery point.
 
@@ -755,12 +756,12 @@ class Replik8sSource:
             recovery_point = datetime.utcnow().isoformat() + 'Z'
             logger.info(f"Making recovery point {recovery_point}")
             recovery_point_dir = os.path.join(self.recovery_points_dir, recovery_point)
-            self.copy_latest_to_dir(target_dir=recovery_point_dir, logger=logger)
+            await self.copy_latest_to_dir(target_dir=recovery_point_dir, logger=logger)
         except Exception as e:
             logger.exception('Error while making recovery point!')
-        self.update_recovery_point_status()
+        await self.update_recovery_point_status()
 
-    def match_token(self, token):
+    async def match_token(self, token):
         '''
         Return boolean indicating whether token matches source.
         '''
@@ -770,13 +771,13 @@ class Replik8sSource:
             return token == self.auth['token']
         if 'secret' in self.auth:
             try:
-                secret = core_v1_api.read_namespaced_secret(self.auth['secret'], self.namespace)
+                secret = await core_v1_api.read_namespaced_secret(self.auth['secret'], self.namespace)
                 if 'token' in secret.data:
                     return token == b64decode(secret.data['token'])
                 else:
                     self.logger.warning('secret %s missing token data', self.auth['secret'])
                     return False
-            except kubernetes.client.rest.ApiException as e:
+            except kubernetes_asyncio.client.exceptions.ApiException as e:
                 if e.status == 404:
                     self.logger.warning('secret %s not found', self.auth['secret'])
                     return False
@@ -785,51 +786,53 @@ class Replik8sSource:
         self.logger.warning('no auth method defined for source')
         return False
 
-    def refresh(self):
+    async def refresh(self):
         self.logger.info('refreshing source')
         for watch in self.watches:
-            watch.refresh()
+            await watch.refresh()
 
-    def resource_kind_to_plural(self, api_group, version, kind):
+    async def resource_kind_to_plural(self, api_group, version, kind):
         if not api_group:
             return inflection.pluralize(kind).lower()
 
         if api_group not in self.api_groups \
         or version not in self.api_groups[api_group]:
-            self.discover_api_group(api_group, version)
+            await self.discover_api_group(api_group, version)
 
         for resource in self.api_groups[api_group][version]['resources']:
             if resource['kind'] == kind:
                 return resource['name']
         raise Replik8sConfigError('unable to find kind {} in {}/{}', kind, api_group, version)
 
-    def save_config(self):
+    async def save_config(self):
         '''
         Save config definition from Kopf object.
         '''
-        makedirs_as_needed(self.basedir)
-        with open(os.path.join(self.basedir, 'config.yaml'), 'w') as f:
-            f.write(f"#{datetime.utcnow().isoformat()}Z\n")
-            f.write(yaml.safe_dump(self.to_dict(), default_flow_style=False))
+        await makedirs_as_needed(self.basedir)
+        async with aiofiles.open(os.path.join(self.basedir, 'config.yaml'), 'w') as f:
+            await f.write(
+                f"#{datetime.utcnow().isoformat()}Z\n" +
+                yaml.safe_dump(self.to_dict(), default_flow_style=False)
+            )
 
-    def start_resource_watch(self, resource):
+    async def start_resource_watch(self, resource):
         watch = Replik8sResourceWatch(source=self, resource=resource)
         self.watches.append(watch)
-        watch.start()
+        await watch.start()
 
-    def start_resources_watch(self):
+    async def start_resources_watch(self):
         self.last_refresh_time = time.time()
         if self.watches:
             self.stop_resources_watch()
         self.watches = []
         self.logger.debug('starting resources watch for %s/%s', self.namespace, self.name)
         for resource in self.resources:
-            self.start_resource_watch(resource)
+            await self.start_resource_watch(resource)
 
     def stop_resources_watch(self):
         self.logger.info('stop resource watches for %s', self.name)
         for watch in self.watches:
-            watch.stop = True
+            watch.task.cancel()
 
     def to_dict(self):
         ret = dict(
@@ -848,23 +851,23 @@ class Replik8sSource:
             ret['spec'] = {**self.spec}
         return ret
 
-    def update_recovery_point_status(self):
+    async def update_recovery_point_status(self):
         try:
             if self.kind == 'ConfigMap':
-                config_map = core_v1_api.read_namespaced_config_map(self.name, self.namespace)
+                config_map = await core_v1_api.read_namespaced_config_map(self.name, self.namespace)
                 status = yaml.safe_load(config_map.data['status']) if 'status' in config_map.data else {}
-                status['recoveryPoints'] = self.recovery_points
+                status['recoveryPoints'] = await self.get_recovery_points()
                 config_map.data['status'] = yaml.safe_dump(status, default_flow_style=False)
-                core_v1_api.replace_namespaced_config_map(self.name, self.namespace, config_map)
+                await core_v1_api.replace_namespaced_config_map(self.name, self.namespace, config_map)
             else:
                 # FIXME? - Future support for custom resource kind?
                 pass
-        except kubernetes.client.rest.ApiException as e:
+        except kubernetes_asyncio.client.exceptions.ApiException as e:
             # Conflict updating status just means it will be picked up in another pass
             if e.status != 409:
                 raise
 
-    def update_watch_status(self):
+    async def update_watch_status(self):
         watch_status = []
         for watch in self.watches:
             watch_status_item = {
@@ -880,22 +883,22 @@ class Replik8sSource:
             watch_status.append(watch_status_item)
         try:
             if self.kind == 'ConfigMap':
-                config_map = core_v1_api.read_namespaced_config_map(self.name, self.namespace)
+                config_map = await core_v1_api.read_namespaced_config_map(self.name, self.namespace)
                 status = yaml.safe_load(config_map.data['status']) if 'status' in config_map.data else {}
                 if watch_status != status.get('watches'):
                     status['watches'] = watch_status
                     config_map.data['status'] = yaml.safe_dump(status, default_flow_style=False)
-                    core_v1_api.replace_namespaced_config_map(self.name, self.namespace, config_map)
+                    await core_v1_api.replace_namespaced_config_map(self.name, self.namespace, config_map)
             else:
                 # FIXME? - Future support for custom resource kind?
                 pass
-        except kubernetes.client.rest.ApiException as e:
+        except kubernetes_asyncio.client.exceptions.ApiException as e:
             # Conflict updating status just means it will be picked up in another pass
             if e.status != 409:
                 raise
 
-    def write_kube_config(self):
-        secret = core_v1_api.read_namespaced_secret(self.kube_config_secret, self.namespace)
+    async def write_kube_config(self):
+        secret = await core_v1_api.read_namespaced_secret(self.kube_config_secret, self.namespace)
         if 'kubeconfig.yaml' not in secret.data:
             raise kopf.TemporaryError('No kubeconfig.yaml not found in secret {} in {}'.format(
                 secret.metadata.name, secret.metadata.namespace
@@ -904,7 +907,9 @@ class Replik8sSource:
             fh.write(b64decode(secret.data['kubeconfig.yaml']))
 
 @kopf.on.startup()
-def startup(settings: kopf.OperatorSettings, **_):
+async def startup(settings: kopf.OperatorSettings, **_):
+    global core_v1_api, custom_objects_api
+
     # Never give up from network errors
     settings.networking.error_backoffs = InfiniteRelativeBackoff()
 
@@ -921,65 +926,80 @@ def startup(settings: kopf.OperatorSettings, **_):
         daemon = True,
     ).start()
 
+    if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount'):
+        kubernetes_asyncio.config.load_incluster_config()
+    else:
+        await kubernetes_asyncio.config.load_kube_config()
+
+    core_v1_api = kubernetes_asyncio.client.CoreV1Api()
+    custom_objects_api = kubernetes_asyncio.client.CustomObjectsApi()
+
+
+@kopf.on.cleanup()
+async def cleanup(logger: kopf.ObjectLogger, **_):
+    await Replik8sSource.stop_all_watches()
+    await core_v1_api.api_client.close()
+    await custom_objects_api.api_client.close()
+    await rmtree(tempdir)
 
 @kopf.on.create('configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def config_create(**kwargs):
-    source = Replik8sSource.load_config_map(**kwargs)
-    source.save_config()
-    source.start_resources_watch()
+async def config_create(**kwargs):
+    source = await Replik8sSource.load_config_map(**kwargs)
+    await source.save_config()
+    await source.start_resources_watch()
 
 @kopf.on.resume('configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def config_resume(**kwargs):
-    source = Replik8sSource.load_config_map(**kwargs)
-    source.save_config()
-    source.start_resources_watch()
+async def config_resume(**kwargs):
+    source = await Replik8sSource.load_config_map(**kwargs)
+    await source.save_config()
+    await source.start_resources_watch()
 
 @kopf.on.update('configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def config_update(diff, **kwargs):
+async def config_update(diff, **kwargs):
     # Ignore update if spec was not changed
     if 0 == len([x for x in diff if x[1] == ('data', 'spec')]):
         return
-    source = Replik8sSource.load_config_map(**kwargs)
-    source.save_config()
-    source.start_resources_watch()
+    source = await Replik8sSource.load_config_map(**kwargs)
+    await source.save_config()
+    await source.start_resources_watch()
 
 @kopf.on.delete('configmaps', labels={replik8s_source_label: kopf.PRESENT})
-def config_delete(name, namespace, **_):
-    Replik8sSource.remove(name=name, namespace=namespace)
+async def config_delete(name, namespace, **_):
+    await Replik8sSource.remove(name=name, namespace=namespace)
 
 @kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
 async def config_refresh(stopped, **kwargs):
-    source = Replik8sSource.load_config_map(**kwargs)
+    source = await Replik8sSource.load_config_map(**kwargs)
     try:
         while not stopped:
             await asyncio.sleep(source.refresh_interval)
-            with source.lock:
-                source.refresh()
+            async with source.lock:
+                await source.refresh()
     except asyncio.CancelledError:
         pass
 
 @kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
 async def config_manage_recovery_points(logger, stopped, **kwargs):
-    source = Replik8sSource.load_config_map(**kwargs)
+    source = await Replik8sSource.load_config_map(**kwargs)
     try:
         while not stopped:
             await asyncio.sleep(source.recovery_point_interval)
-            with source.lock:
-                source.make_recovery_point(logger=logger)
-                source.prune_recovery_points(logger=logger)
-                source.clean_cache(logger=logger)
-                source.clean_latest(logger=logger)
+            async with source.lock:
+                await source.make_recovery_point(logger=logger)
+                await source.prune_recovery_points(logger=logger)
+                await source.clean_cache(logger=logger)
+                await source.clean_latest(logger=logger)
     except asyncio.CancelledError:
         pass
 
 @kopf.daemon('configmaps', labels={replik8s_source_label: kopf.PRESENT})
 async def config_update_watch_status(logger, stopped, **kwargs):
-    source = Replik8sSource.load_config_map(**kwargs)
+    source = await Replik8sSource.load_config_map(**kwargs)
     try:
         while not stopped:
             await asyncio.sleep(10)
-            with source.lock:
-                source.update_watch_status()
+            async with source.lock:
+                await source.update_watch_status()
     except asyncio.CancelledError:
         pass
 
@@ -990,49 +1010,56 @@ def get_auth_token():
     return auth_header[7:]
 
 @api.route('/sources', methods=['GET'])
-def get_sources():
+async def get_sources():
     token = get_auth_token()
-    sources = Replik8sSource.get_by_token(token)
+    sources = await Replik8sSource.get_by_token(token)
     return flask.jsonify([
         source.namespace + '/' + source.name for source in sources
     ])
 
 @api.route('/sources/<string:source_namespace>/<string:source_name>/latest', methods=['GET'])
-def get_latest(source_namespace, source_name):
+async def get_latest(source_namespace, source_name):
     token = get_auth_token()
     source = Replik8sSource.get(namespace=source_namespace, name=source_name)
-    if not source and source.match_token(token):
+    if not source:
+        flask.abort(404)
+    if not await source.match_token(token):
         flask.abort(400)
 
     return flask.jsonify(dict(
-        apiVersion='v1',
-        kind='List',
-        metadata=dict(),
-        items=source.get_latest_items()
+        apiVersion = 'v1',
+        kind = 'List',
+        metadata = dict(),
+        items = await source.get_latest_items()
     ))
 
 @api.route('/sources/<string:source_namespace>/<string:source_name>/recovery-points', methods=['GET'])
-def get_recovery_points(source_namespace, source_name):
+async def get_recovery_points(source_namespace, source_name):
     token = get_auth_token()
     source = Replik8sSource.get(namespace=source_namespace, name=source_name)
-    if not source and source.match_token(token):
+    if not source:
+        flask.abort(404)
+    if not await source.match_token(token):
         flask.abort(400)
-    return flask.jsonify(source.recovery_points)
+    recovery_points = await source.get_recovery_points()
+    return flask.jsonify(recovery_points)
 
 @api.route('/sources/<string:source_namespace>/<string:source_name>/recovery-points/<string:recovery_point>', methods=['GET'])
-def get_recovery_point(source_namespace, source_name, recovery_point):
+async def get_recovery_point(source_namespace, source_name, recovery_point):
     token = get_auth_token()
     source = Replik8sSource.get(namespace=source_namespace, name=source_name)
-    if not source and source.match_token(token):
+    if not source:
+        flask.abort(404)
+    if not await source.match_token(token):
         flask.abort(400)
 
-    items = source.get_recovery_point_items(recovery_point)
+    items = await source.get_recovery_point_items(recovery_point)
     if items == None:
         flask.abort(404)
 
     return flask.jsonify(dict(
-        apiVersion='v1',
-        kind='List',
-        metadata=dict(),
-        items=items
+        apiVersion = 'v1',
+        kind = 'List',
+        metadata = dict(),
+        items = items
     ))
