@@ -30,7 +30,7 @@ Selector labels
 */}}
 {{- define "replik8s.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "replik8s.name" . }}
-{{-   if (ne .Release.Name "RELEASE-NAME") }}
+{{-   if (ne (lower .Release.Name) "release-name") }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{-   end -}}
 {{- end -}}
@@ -50,10 +50,10 @@ Create the name of the service account to use
 Define the image to deploy
 */}}
 {{- define "replik8s.image" -}}
-  {{- if eq .Values.image.tagOverride "-" -}}
-    {{- .Values.image.repository -}}
-  {{- else if .Values.image.tagOverride -}}
-    {{- printf "%s:%s" .Values.image.repository .Values.image.tagOverride -}}
+  {{- if .Values.image.override -}}
+    {{- .Values.image.override -}}
+  {{- else if .Values.image.tag -}}
+    {{- printf "%s:%s" .Values.image.repository .Values.image.tag -}}
   {{- else -}}
     {{- printf "%s:v%s" .Values.image.repository .Chart.AppVersion -}}
   {{- end -}}

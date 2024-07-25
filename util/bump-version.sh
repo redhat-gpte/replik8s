@@ -35,10 +35,12 @@ if [[ -n "$(git status --porcelain | grep -v '^?? ')" ]]; then
     echo "Cannot set version when working directory has differences"
 fi
 
-sed -i "s/^version: .*/version: ${TAG:1}/" helm/Chart.yaml
-sed -i "s/^appVersion: .*/appVersion: ${VERSION:1}/" helm/Chart.yaml
+sed -i "s/^version: .*/version: ${TAG:1}/" helm/replik8s/Chart.yaml
+sed -i "s/^version: .*/version: ${TAG:1}/" helm/replik8s-openshift-build/Chart.yaml
+sed -i "s/^appVersion: .*/appVersion: ${VERSION:1}/" helm/replik8s-openshift-build/Chart.yaml
 
-git add helm/Chart.yaml
+git add helm/replik8s/Chart.yaml
+git add helm/replik8s-openshift-build/Chart.yaml
 git commit -m "Release $TAG"
 git tag $TAG
 git push origin main $TAG

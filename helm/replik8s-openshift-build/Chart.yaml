@@ -1,0 +1,7 @@
+---
+apiVersion: v2
+name: replik8s-openshift-build
+description: Chart for OpenShift BuildConfig and ImageStream
+type: application
+version: 1.0.0
+appVersion: 1.0.0

@@ -1,0 +1,79 @@
+# Development
+
+Development on this operator can be performed in the `odo` OpenShift developer
+CLI or building with OpenShift build configs.
+An OpenShift cluster with cluster-admin is required for `odo` development.
+https://developers.redhat.com/products/codeready-containers/overview[CodeReady Containers]
+is recommended for local development.
+An Ansible test suite is available for functional testing.
+
+## Development with `odo`
+
+Use of `odo` is recommended for fast iterative development.
+`odo` simplifies the build/deploy process and avoids creating unnecessary build
+artifacts during the development process.
+
+. Install the `odo` developer CLI as described in the
+https://developers.redhat.com/products/odo/overview[OpenShift documentation]
+
+. Create a project namespace or change namespace if already exists:
++
+------------------------------------------
+oc new-project replik8s
+------------------------------------------
++
+------------------------------------------
+oc project replik8s
+------------------------------------------
+
+. Create resources required for development from helm chart:
++
+------------------------------------------
+helm template helm/replik8s \
+--include-crds \
+--set deploy=false \
+--set namespace.name=replik8s \
+| oc apply -f -
+------------------------------------------
+
+. Grant privileges for role `replik8s` to default service account:
++
+------------------------------------------------------------------------
+oc policy add-role-to-user --role-namespace=replik8s replik8s -z default
+------------------------------------------------------------------------
+
+. Start development deployment:
++
+-------
+odo dev
+-------
+
+. To watch logs
++
+-----------------
+odo logs --follow
+-----------------
+
+== Building
+
+The helm tomplate provided includes build configuration for OpenShift:
+
+. Create OpenShift BuildConfig and ImageStream
++
+-----------------------------------------------------------
+helm template helm/replik8s-openshift-build | oc apply -f -
+-----------------------------------------------------------
+
+. Build replik8s image:
++
+---------------------------------------------
+oc start-build replik8s --from-dir=. --follow
+---------------------------------------------
+
+. Deploy replik8s from build image:
++
+--------------------------------------------------------------------------------
+helm template helm/replik8s --include-crds \
+--set=image.override=$(oc get imagestream replik8s -o jsonpath='{.status.tags[?(@.tag=="latest")].items[0].dockerImageReference}') \
+| oc apply -f -
+--------------------------------------------------------------------------------

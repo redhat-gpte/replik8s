@@ -1,0 +1,3 @@
+---
+replik8s_namespace: replik8s
+test_replication_source_namespace: replik8s-test
