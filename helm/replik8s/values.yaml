@@ -1,0 +1,44 @@
+api:
+  group: replik8s.rhpds.redhat.com
+  version: v1
+deploy: true
+image:
+  #override: ...
+  #tag: ...
+  repository: quay.io/rhpds/replik8s
+persistentVolume:
+  create: true
+  spec:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+
+serviceAccount:
+  create: true
+  #name: replik8s
+ 
+#kubeConfigs:
+#  remote: |
+#    apiVersion: v1
+#    clusters:
+#    ...
+
+#replicationSources:
+#  operators:
+#    kubeConfig:
+#      secret: remote
+#    resources:
+#    - apiVersion: operators.coreos.com/v1alpha1
+#      kind: CatalogSource
+#    - apiVersion: operators.coreos.com/v1alpha1
+#      kind: ClusterServiceVersion
+#    - apiVersion: operators.coreos.com/v1alpha1
+#      kind: InstallPlan
+#    - apiVersion: operators.coreos.com/v1
+#      kind: Operator
+#    - apiVersion: operators.coreos.com/v1
+#      kind: OperatorGroup
+#    - apiVersion: operators.coreos.com/v1alpha1
+#      kind: Subscription

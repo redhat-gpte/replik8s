@@ -1,0 +1,41 @@
+---
+- hosts: localhost
+  gather_facts: false
+  vars:
+    replik8s_namespace: replik8s
+    tests:
+    - replicate_local
+  tasks:
+  - name: Get replik8s pod
+    kubernetes.core.k8s_info:
+      api_version: v1
+      kind: Pod
+      namespace: "{{ replik8s_namespace }}"
+      label_selectors:
+      #- app.kubernetes.io/instance=replik8s
+      - app.kubernetes.io/name=replik8s
+    register: r_get_replik8s_pod
+    failed_when: r_get_replik8s_pod.resources | default([]) | length != 1
+
+  - name: Set vars for test
+    set_fact:
+      replik8s_pod: "{{ r_get_replik8s_pod.resources[0] }}"
+
+  - name: Cleanup to reset before Running tests
+    include_role:
+      name: "{{ __test_role }}"
+      tasks_from: cleanup.yml
+    loop: "{{ tests }}"
+    loop_control:
+      loop_var: __test
+    vars:
+      __test_role: test_{{ __test }}
+
+  - name: Run tests
+    include_role:
+      name: "{{ __test_role }}"
+    loop: "{{ tests }}"
+    loop_control:
+      loop_var: __test
+    vars:
+      __test_role: test_{{ __test }}

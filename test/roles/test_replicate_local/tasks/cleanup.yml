@@ -1,0 +1,14 @@
+---
+- name: Cleanup ReplicationSource test-replicate-local 
+  kubernetes.core.k8s:
+    state: absent
+    api_version: replik8s.rhpds.redhat.com/v1
+    kind: ReplicationSource
+    name: test-replicate-local
+
+- name: Cleanup test-replicate-local source namespace
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Namespace
+    name: "{{ test_replication_source_namespace }}"

@@ -1,0 +1,11 @@
+{{- range $name, $spec := .Values.replicationsources }}
+---
+apiVersion: replik8s.rhpds.redhat.com/v1
+kind: ReplicationSource
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "replik8s.labels" $ | nindent 4 }}
+spec:
+  {{ $spec | toYaml | nindent 2 }}
+{{- end }}

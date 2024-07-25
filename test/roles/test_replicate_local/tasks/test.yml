@@ -1,0 +1,177 @@
+---
+- name: Create test-replicate-local source namespace
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ test_replication_source_namespace }}"
+
+- name: Create test-replicate-local service
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: test-service
+        namespace: "{{ test_replication_source_namespace }}"
+      spec:
+        ports:
+        - name: http
+          port: 80
+        selector:
+          foo: bar
+
+- name: Create test-replicate-local role
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: test-replicate-local
+        namespace: "{{ test_replication_source_namespace }}"
+      rules:
+      - apiGroups:
+        - ""
+        resources:
+        - services
+        verbs:
+        - get
+        - list
+        - watch
+      - apiGroups:
+        - rbac.authorization.k8s.io
+        resources:
+        - roles
+        verbs:
+        - get
+        - list
+        - watch
+
+- name: Create test-replicate-local rolebinding
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: test-replicate-local
+        namespace: "{{ test_replication_source_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: test-replicate-local
+      subjects:
+      - kind: ServiceAccount
+        name: "{{ replik8s_pod.spec.serviceAccountName }}"
+        namespace: replik8s
+  
+- name: Create ReplicationSource test-replicate-local
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: replik8s.rhpds.redhat.com/v1
+      kind: ReplicationSource
+      metadata:
+        name: test-replicate-local
+        namespace: "{{ replik8s_namespace }}"
+      spec: 
+        recoveryPointInterval: 30s
+        recoveryPointMaxAge: 2m
+        refreshInterval: 30s
+        replicateLocal: true
+        resources:
+        - apiVersion: v1
+          kind: Service
+          namespace: "{{ test_replication_source_namespace }}"
+        - apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          namespace: "{{ test_replication_source_namespace }}"
+
+- name: Verify watch status
+  kubernetes.core.k8s_info:
+    api_version: replik8s.rhpds.redhat.com/v1
+    kind: ReplicationSource
+    name: test-replicate-local
+    namespace: "{{ replik8s_namespace }}"
+  register: r_get_replication_source
+  failed_when: >-
+    r_get_replication_source.resources[0].status.watches[0].state | default('') != 'Watching' or
+    r_get_replication_source.resources[0].status.watches[1].state | default('') != 'Watching'
+  delay: 2
+  retries: 10 
+  until: r_get_replication_source is successful
+
+- name: Verify recovery point created
+  kubernetes.core.k8s_info:
+    api_version: replik8s.rhpds.redhat.com/v1
+    kind: ReplicationSource
+    name: test-replicate-local
+    namespace: "{{ replik8s_namespace }}"
+  register: r_get_replication_source
+  failed_when: >-
+    r_get_replication_source.resources[0].status.recoveryPoints | default([]) | length < 1
+  delay: 2
+  retries: 10 
+  until: r_get_replication_source is successful
+
+- name: Fetch service from recovery point
+  vars:
+    __recovery_point_path: "{{ r_get_replication_source.resources[0].status.recoveryPoints[-1].path }}"
+  command: >-
+    oc exec {{ replik8s_pod.metadata.name }} -n {{ replik8s_pod.metadata.namespace }} --
+    cat {{ __recovery_point_path }}/replik8s-test/services/test-service.json
+  register: r_get_service
+
+- name: Fetch role from recovery point
+  vars:
+    __recovery_point_path: "{{ r_get_replication_source.resources[0].status.recoveryPoints[-1].path }}"
+  command: >-
+    oc exec {{ replik8s_pod.metadata.name }} -n {{ replik8s_pod.metadata.namespace }} --
+    cat {{ __recovery_point_path }}/replik8s-test/roles.rbac.authorization.k8s.io/test-replicate-local.json
+  register: r_get_role
+
+- name: Check service from recovery point
+  vars:
+    __service: "{{ r_get_service.stdout | from_json }}"
+  assert:
+    that:
+    - __service.metadata.name == 'test-service'
+    - __service.metadata.namespace == test_replication_source_namespace
+    - __service.spec.ports[0].name == 'http'
+    - __service.spec.ports[0].port == 80
+
+- name: Check role from recovery point
+  vars:
+    __role: "{{ r_get_role.stdout | from_json }}"
+  assert:
+    that:
+    - __role.metadata.name == 'test-replicate-local'
+    - __role.metadata.namespace == test_replication_source_namespace
+    - __role.rules | length == 2
+
+- name: Delete ReplicationSource test-replicate-local
+  kubernetes.core.k8s:
+    api_version: replik8s.rhpds.redhat.com/v1
+    kind: ReplicationSource
+    name: test-replicate-local
+    namespace: "{{ replik8s_namespace }}"
+    state: absent
+
+- name: Verify data removed for test-replicate-local
+  vars:
+    __base_dir: "{{ r_get_replication_source.resources[0].status.latestPath | dirname }}"
+  command: >-
+    oc exec {{ replik8s_pod.metadata.name }} -n {{ replik8s_pod.metadata.namespace }} --
+    ls {{ __base_dir }}
+  register: r_verify_removed
+  failed_when: >-
+    r_verify_removed.rc == 0 or
+    'No such file or directory' not in r_verify_removed.stderr
+
+- name: Verify ReplicationSource test-replicate-local delete completed
+  kubernetes.core.k8s_info:
+    api_version: replik8s.rhpds.redhat.com/v1
+    kind: ReplicationSource
+    name: test-replicate-local
+    namespace: "{{ replik8s_namespace }}"
+  register: r_get_replication_source
+  failed_when: r_get_replication_source.resources | length != 0

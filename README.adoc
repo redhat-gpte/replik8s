@@ -4,15 +4,17 @@ Replik8s watches resource definitions and keeps a record in a persistent volume.
 
 == Configuration
 
+Replik8s is configured with the ReplicationSource resources in the replik8s.rhpds.redhat.com API group.
+
+Example Configuration:
+
 --------------------------------------------
-apiVersion: v1
-kind: ConfigMap
+apiVersion: replik8s.rhpds.redhat.com/v1
+kind: ReplicationSource
 metadata:
   name: operators
-  labels:
-    replik8s.gpte.redhat.com/source: ''
 data:
-  spec: |
+  spec:
     kubeConfig:
       secret: kubeconfig
     resources:
@@ -28,94 +30,19 @@ data:
       kind: OperatorGroup
     - apiVersion: operators.coreos.com/v1alpha1
       kind: Subscription
-...
 --------------------------------------------
 
-== Using this Example with `odo`
+To create kubeconfig secret for access to source cluster:
 
-Ensure that the `python-kopf` image stream is available in the `openshift` namespace.
-
-. Create project namespace for replik8s development:
-+
--------------------------------
-odo project create replik8s-dev
--------------------------------
-
-. Create role for `replik8s`:
-+
-------------------------------------------------------
-helm template --set deploy=false helm/ | oc apply -f -
-------------------------------------------------------
-
-. Grant `replik8s` access to default service account:
-+
---------------------------------------------------------------------------------
-oc policy add-role-to-user --role-namespace=$(oc project -q) replik8s -z default
---------------------------------------------------------------------------------
-
-. Setup `odo` from devfile:
-+
----------------------------------
-odo create --devfile devfile.yaml
----------------------------------
-
-. Push code with `odo`:
-+
---------
-odo push
---------
-
-. Create `kubeconfig` secret with kubeconfig file for source cluster:
-+
 ---------------------------------------------------------------
 oc create secret generic kubeconfig --from-file=kubeconfig.yaml
 ---------------------------------------------------------------
 
-. Create a config map:
-+
-------------------------------
-oc create -f examples/operators.yaml
-------------------------------
+The ReplicationSource must be created in the same namespace as where replik8s itself is running.
 
-. Check logs:
-+
--------
-odo log
--------
+== Deploment
 
-. Verify data collection:
-+
---------------------------------------------------------------------------------
-oc exec deployment/replik8s -- bash -c 'find /tmp/data*/replik8s-dev/babylon -type f'
---------------------------------------------------------------------------------
-
-. Cleanup
-+
-----------
-odo delete
-----------
-
-== Building
-
-The helm tomplate provided includes build configuration for OpenShift:
-
-. Create OpenShift BuildConfig and ImageStream
-+
---------------------------------------------------------------------------------
-helm template helm/ --set openshift.build.create=true --set deploy=false | oc apply -f -
---------------------------------------------------------------------------------
-
-. Build replik8s image:
-+
----------------------------------------------
-oc start-build replik8s --from-dir=. --follow
----------------------------------------------
-
-. Deploy replik8s from build image:
-+
---------------------------------------------------------------------------------
-helm template helm \
---set=image.tagOverride=- \
---set=image.repository=$(oc get imagestream replik8s -o jsonpath='{.status.tags[?(@.tag=="latest")].items[0].dockerImageReference}') \
-| oc apply -f -
---------------------------------------------------------------------------------
+----------------------------------------------------------
+oc new-project replik8s
+helm template helm/replik8s --include-crds | oc apply -f -
+----------------------------------------------------------

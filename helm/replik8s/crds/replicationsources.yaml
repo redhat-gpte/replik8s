@@ -1,0 +1,125 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: replicationsources.replik8s.rhpds.redhat.com
+spec:
+  group: replik8s.rhpds.redhat.com
+  scope: Namespaced
+  names:
+    plural: replicationsources
+    singular: replicationsource
+    kind: ReplicationSource
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    additionalPrinterColumns: []
+    schema:
+      openAPIV3Schema:
+        description: >-
+          Replik8s replication sources configure replik8s to replicate data
+          from a given source to the local data store or cluster.
+        type: object
+        required:
+        - apiVersion
+        - kind
+        - metadata
+        - spec
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+            properties:
+              name:
+                type: string
+                maxLength: 63
+                pattern: ^[a-z0-9A-Z]([a-z0-9A-Z\-._]*[a-z0-9A-Z])?$
+          spec:
+            description: >-
+              Replik8s replication source configuration.
+            type: object
+            required:
+            - resources
+            properties:
+              kubeConfig:
+                description: >-
+                  Kuburnetes configuration with configuration for connecting to remote cluster.
+                  Mutually exclusive with spec.replicateLocal.
+                type: object
+                required:
+                - secret
+                properties:
+                  secret:
+                    description: >-
+                      Secret name which contains the kubeconfig file in data key "kubeconfig.yaml".
+                    type: string
+              recoveryPointInterval:
+                type: string
+              recoveryPointMaxAge:
+                type: string
+              refreshInterval:
+                type: string
+              replicateLocal:
+                description: >-
+                  Configure replication source to use local cluster API as source.
+                  Mutually exclusive with spec.kubeConfig.
+                type: boolean
+              resources:
+                description: >-
+                  Configuration for resources to replicate from remote cluster.
+                type: array
+                items:
+                  type: object
+                  required:
+                  - apiVersion
+                  - kind
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    namespace:
+                      type: string
+          status:
+            description: Replik8s status for replication source.
+            type: object
+            properties:
+              latestPath:
+                type: string
+              diffBase:
+                description: Kopf diffbase
+                type: string
+              kopf:
+                description: Kopf status
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              recoveryPoints:
+                description: Point in time recovery points available for restore.
+                type: array
+                items:
+                  type: object
+                  properties:
+                    path:
+                      type: string
+                    timestamp:
+                      type: string
+              watches:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    apiVersion:
+                      type: string
+                    error:
+                      type: string
+                    kind:
+                      type: string
+                    namespace:
+                      type: string
+                    state:
+                      type: string
