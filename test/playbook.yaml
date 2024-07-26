@@ -6,20 +6,36 @@
     tests:
     - replicate_local
   tasks:
-  - name: Get replik8s pod
+  - name: Get replik8s pod (odo)
     kubernetes.core.k8s_info:
       api_version: v1
       kind: Pod
       namespace: "{{ replik8s_namespace }}"
       label_selectors:
-      #- app.kubernetes.io/instance=replik8s
-      - app.kubernetes.io/name=replik8s
-    register: r_get_replik8s_pod
-    failed_when: r_get_replik8s_pod.resources | default([]) | length != 1
+      - app.kubernetes.io/instance=replik8s
+    register: r_get_replik8s_odo_pod
 
-  - name: Set vars for test
+  - name: Set vars for test (odo)
+    when: r_get_replik8s_odo_pod.resources | length == 1
     set_fact:
-      replik8s_pod: "{{ r_get_replik8s_pod.resources[0] }}"
+      replik8s_pod: "{{ r_get_replik8s_odo_pod.resources[0] }}"
+
+  - when: r_get_replik8s_odo_pod.resources | length == 0
+    block:
+    - name: Get replik8s pod
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ replik8s_namespace }}"
+        label_selectors:
+        #- app.kubernetes.io/instance=replik8s
+        - app.kubernetes.io/name=replik8s
+      register: r_get_replik8s_pod
+      failed_when: r_get_replik8s_pod.resources | default([]) | length != 1
+
+    - name: Set vars for test
+      set_fact:
+        replik8s_pod: "{{ r_get_replik8s_pod.resources[0] }}"
 
   - name: Cleanup to reset before Running tests
     include_role:
