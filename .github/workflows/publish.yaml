@@ -25,8 +25,8 @@ jobs:
         # To determine VERSION, strip off any release number suffix
         VERSION=${RELEASE/-*/}
 
-        # Verify version from helm/Chart.yaml
-        HELM_CHART_VERSION=$(sed -nr 's/^appVersion: (.*)/\1/p' helm/Chart.yaml)
+        # Verify version from helm/replik8s/Chart.yaml
+        HELM_CHART_VERSION=$(sed -nr 's/^appVersion: (.*)/\1/p' helm/replik8s/Chart.yaml)
         if [[ "${HELM_CHART_VERSION}" != "${VERSION}" ]]; then
           echo "Helm chart version does not match tag!"
           exit 1
