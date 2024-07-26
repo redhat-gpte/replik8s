@@ -37,7 +37,7 @@ jobs:
         if [[ "${VERSION}" == "${RELEASE}" ]]; then
           # Publish to latest, minor, and patch tags
           # Ex: latest,v0.1.2,v0.1
-          echo "IMAGE_TAGS=latest ${VERSION%.*} ${VERSION}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAGS=latest v${VERSION%.*} v${VERSION}" >> $GITHUB_OUTPUT
         fi
 
     - name: Set up Docker Buildx
