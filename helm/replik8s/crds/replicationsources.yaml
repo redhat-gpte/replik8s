@@ -15,7 +15,6 @@ spec:
     storage: true
     subresources:
       status: {}
-    additionalPrinterColumns: []
     schema:
       openAPIV3Schema:
         description: >-
