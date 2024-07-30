@@ -46,3 +46,94 @@ The ReplicationSource must be created in the same namespace as where replik8s it
 oc new-project replik8s
 helm template helm/replik8s --include-crds | oc apply -f -
 ----------------------------------------------------------
+
+== Restore
+
+Restore may be performed from either the latest version of the data within the
+pod or from a recovery point.
+Each ReplicationSource exposes the path to its data directory within its status
+for ease of extraction.
+
+Example commands to extract the latest data from replik8s:
+
+----
+POD=$(oc get pod -l app.kubernetes.io/name=replik8s -o jsonpath={.items[0].metadata.name})
+LATEST_PATH=$(oc get replicationsource -o jsonpath={.items[0].status.latestPath})
+oc rsync $POD:$LATEST_PATH .
+----
+
+Replik8s includes the `replik8s-restore` utility which may be used to restore
+backups including restoring the status on resources. The effectiveness of this
+command depends on the compatibility of the resources to restore.
+It may be necessary to stop deployments and operators running within the
+cluster before initiating a restore.
+
+To restore with `replik8s-restore` you will need a RestoreConfig resource.
+For example:
+
+----
+apiVersion: replik8s.rhpds.redhat.com/v1
+kind: RestoreConfig
+metadata:
+  name: anarchy
+spec:
+  resources:
+  - apiVersion: anarchy.gpte.redhat.com/v1
+    kind: AnarchyAction
+    restoreConflictStrategy: replace
+    restoreInProgressLabels:
+      anarchy.gpte.redhat.com/ignore: restoring
+    restoreStatus: true
+  - apiVersion: anarchy.gpte.redhat.com/v1
+    kind: AnarchyRun
+    restoreConflictStrategy: replace
+    restoreInProgressLabels:
+      anarchy.gpte.redhat.com/ignore: restoring
+    restoreStatus: true
+  - apiVersion: anarchy.gpte.redhat.com/v1
+    kind: AnarchySubject
+    restoreConflictStrategy: replace
+    restoreInProgressLabels:
+      anarchy.gpte.redhat.com/ignore: restoring
+    restoreStatus: true
+----
+
+In this configuration the label `anarchy.gpte.redhat.com/ignore` will be applied
+to each resource created or replaced during the restoration process.
+The Anarchy kopf operator is designed to ignore any resources with this label
+so that the resources may be restored without being handled as new resources
+during the restore.
+Once the restore is complete the ignore label is removed so that normal
+processing resumes.
+
+A restore config may be stored in a local file or in the cluster.
+
+If stored in the cluster then restoration may be performed with:
+
+----
+replik8s-restore --config NAME PATH/TO/BACKUP/DATA
+----
+
+If stored in a local file then restoration may be performed with:
+
+----
+replik8s-restore --config-path CONFIG_FILE PATH/TO/BACKUP/DATA
+----
+
+Finally, the `replik8s-restore` command is available within the replik8s
+pod to allow for restoration without needing to copy files out of the
+pod first.
+In order to use `replik8s-restore` within the pod you will first need
+to temporarily grant necessary cluster access to the replik8s pod.
+
+For example:
+
+----
+oc adm policy add-cluster-role-to-user cluster-admin -z replik8s --rolebinding-name=replik8s:cluster-admin
+----
+
+When restoration is complete, the cluster role binding can be removed with:
+
+----
+oc delete clusterrolebinding replik8s:cluster-admin
+----
