@@ -42,3 +42,5 @@ serviceAccount:
 #      kind: OperatorGroup
 #    - apiVersion: operators.coreos.com/v1alpha1
 #      kind: Subscription
+
+#restoreConfigs:
