@@ -36,6 +36,7 @@ if [[ -n "$(git status --porcelain | grep -v '^?? ')" ]]; then
 fi
 
 sed -i "s/^version: .*/version: ${TAG:1}/" helm/replik8s/Chart.yaml
+sed -i "s/^appVersion: .*/appVersion: ${VERSION:1}/" helm/replik8s/Chart.yaml
 sed -i "s/^version: .*/version: ${TAG:1}/" helm/replik8s-openshift-build/Chart.yaml
 sed -i "s/^appVersion: .*/appVersion: ${VERSION:1}/" helm/replik8s-openshift-build/Chart.yaml
 

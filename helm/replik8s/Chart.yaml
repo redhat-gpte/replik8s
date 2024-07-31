@@ -4,4 +4,4 @@ name: replik8s
 description: Kubernetes resource replication and backup
 type: application
 version: 1.0.1
-appVersion: 1.0.0
+appVersion: 1.0.1
