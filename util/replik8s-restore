@@ -667,6 +667,8 @@ def init_logger():
     logger.propagate = False
 
 def main():
+    init_logger()
+
     parser = argparse.ArgumentParser(description='Restore resources from backup.')
     parser.add_argument('backup', metavar="BACKUP_PATH", nargs=1, type=str)
     config_arg_group = parser.add_mutually_exclusive_group(required=True)
@@ -686,7 +688,7 @@ def main():
         elif os.path.exists('/run/secrets/kubernetes.io/serviceaccount/namespace'):
             name = args.config
             with open('/run/secrets/kubernetes.io/serviceaccount/namespace') as fh:
-                namespace = fh.read
+                namespace = fh.read()
         else:
             name = args.config
             _, active_context = kubernetes.config.list_kube_config_contexts()
@@ -700,7 +702,6 @@ def main():
     if not os.path.exists(args.backup[0]):
         parser.error(f"Backup {args.backup[0]} not found!")
 
-    init_logger()
     restore_config.restore_backup(
         backup_path=args.backup[0],
     )
