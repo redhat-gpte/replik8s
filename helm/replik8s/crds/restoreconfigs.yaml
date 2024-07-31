@@ -1,0 +1,71 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: restoreconfigs.replik8s.rhpds.redhat.com
+spec:
+  group: replik8s.rhpds.redhat.com
+  scope: Namespaced
+  names:
+    plural: restoreconfigs
+    singular: restoreconfig
+    kind: RestoreConfig
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        description: >-
+          Replik8s restore configuration.
+        type: object
+        required:
+        - apiVersion
+        - kind
+        - metadata
+        - spec
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+            properties:
+              name:
+                type: string
+                maxLength: 63
+                pattern: ^[a-z0-9A-Z]([a-z0-9A-Z\-._]*[a-z0-9A-Z])?$
+          spec:
+            description: >-
+              Replik8s restore configuration.
+            type: object
+            required:
+            - resources
+            properties:
+              resources:
+                description: >-
+                  Configuration for resources to replicate from remote cluster.
+                type: array
+                items:
+                  type: object
+                  required:
+                  - apiVersion
+                  - kind
+                  properties:
+                    apiVersion:
+                      type: string
+                    createNamespace:
+                      type: boolean
+                    kind:
+                      type: string
+                    restoreConflictStrategy:
+                      type: string
+                      enum:
+                      - replace
+                      - skip
+                    restoreInProgressLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    restoreStatus:
+                      type: boolean
