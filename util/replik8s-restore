@@ -329,7 +329,7 @@ class RestoreConfig():
 
         if api_version == 'v1' and kind == 'List':
             for item in resource.get('items', []):
-                self.load_backup_resource(resource, file_path)
+                self.load_backup_resource(resource, item)
         else:
             self.load_backup_resource(resource, file_path)
 
