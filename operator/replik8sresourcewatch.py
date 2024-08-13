@@ -109,8 +109,8 @@ class Replik8sResourceWatch():
                 self.state = 'Error'
                 self.error = str(exception)
                 raise
-            self.state = 'Watching'
             while True:
+                self.state = 'Watching'
                 watch_start_dt = datetime.now(timezone.utc)
                 try:
                     await self.__watch(method, **kwargs)
